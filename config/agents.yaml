@@ -1,0 +1,96 @@
+version: 1
+mode: paper_proposal
+# The environment switch must also be enabled before daily-run invokes a model.
+automatic_daily_run: true
+
+model_profiles:
+  fast:
+    provider: codex_cli
+    # Null inherits the locally installed Codex default. Pin a model slug here after evals.
+    model: null
+    reasoning_effort: medium
+  deep:
+    provider: codex_cli
+    model: null
+    reasoning_effort: high
+
+roles:
+  research_compactor:
+    enabled: true
+    profile: fast
+    prompt: prompts/research_compactor.md
+    context_sources: [candidate_overview, deep_research]
+    max_context_chars: 160000
+    max_document_chars: 5000
+    max_output_chars: 30000
+    timeout_seconds: 600
+    permissions:
+      filesystem: read-only
+      web_search: false
+      can_submit_orders: false
+      can_mutate_knowledge: false
+
+  daily_trader:
+    enabled: true
+    profile: deep
+    prompt: prompts/daily_trader.md
+    context_sources:
+      - strategy_current
+      - portfolio_policy
+      - account_snapshot
+      - positions
+      - open_orders
+      - candidate_overview
+      - deep_research
+      - recent_decisions
+    max_context_chars: 220000
+    max_document_chars: 7000
+    max_output_chars: 50000
+    timeout_seconds: 900
+    permissions:
+      filesystem: read-only
+      web_search: false
+      can_submit_orders: false
+      can_mutate_knowledge: false
+
+  event_trader:
+    enabled: true
+    profile: deep
+    prompt: prompts/event_trader.md
+    context_sources:
+      - strategy_current
+      - portfolio_policy
+      - account_snapshot
+      - positions
+      - open_orders
+      - scheduled_event
+      - deep_research
+      - recent_decisions
+    max_context_chars: 160000
+    max_document_chars: 7000
+    max_output_chars: 40000
+    timeout_seconds: 900
+    permissions:
+      filesystem: read-only
+      web_search: false
+      can_submit_orders: false
+      can_mutate_knowledge: false
+
+  weekly_strategist:
+    enabled: false
+    profile: deep
+    prompt: prompts/weekly_strategist.md
+    context_sources:
+      - strategy_current
+      - portfolio_policy
+      - recent_decisions
+      - weekly_performance
+    max_context_chars: 220000
+    max_document_chars: 7000
+    max_output_chars: 60000
+    timeout_seconds: 1200
+    permissions:
+      filesystem: read-only
+      web_search: false
+      can_submit_orders: false
+      can_mutate_knowledge: true

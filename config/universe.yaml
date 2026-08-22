@@ -1,0 +1,13 @@
+source: alpaca
+asset_class: us_equity
+require_active: true
+require_tradable: true
+benchmark_symbols: [SPY, QQQ]
+event_symbols: [SPY, QQQ]
+excluded_symbols: []
+candidate_selection:
+  max_candidates: 50
+  most_active_by_volume: 20
+  most_active_by_trades: 20
+  market_movers_per_side: 20
+  exploration_candidates: 5

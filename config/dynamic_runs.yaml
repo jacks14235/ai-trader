@@ -1,0 +1,36 @@
+enabled: true
+max_extra_runs_per_day: 3
+max_extra_runs_per_symbol_per_day: 2
+minimum_spacing_minutes: 30
+max_schedule_horizon_days: 30
+max_event_followup_delay_minutes: 360
+max_lateness_minutes: 30
+lease_minutes: 10
+max_attempts: 2
+max_claims_per_tick: 3
+allowed_event_types:
+  - EARNINGS_RELEASE
+  - EARNINGS_CALL
+  - FDA_DECISION
+  - INVESTOR_DAY
+  - ECONOMIC_RELEASE
+discovery:
+  enabled: true
+  source:
+    provider: bea
+    cache_path: data/paper/cache/bea_release_dates.json
+    included_release_names:
+      - Gross Domestic Product
+      - Personal Income and Outlays
+      - U.S. International Trade in Goods and Services
+    timeout_seconds: 10
+    max_cache_age_minutes: 1440
+    max_fetch_attempts: 3
+  lookahead_days: 7
+  minimum_confidence: 0.8
+  followup_offsets_minutes:
+    EARNINGS_RELEASE: 10
+    EARNINGS_CALL: 15
+    FDA_DECISION: 10
+    INVESTOR_DAY: 15
+    ECONOMIC_RELEASE: 10

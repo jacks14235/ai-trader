@@ -1,0 +1,48 @@
+mode: paper
+broker_account:
+  no_shorting: true
+  max_margin_multiplier: 1
+  max_options_trading_level: 0
+  disable_overnight_trading: true
+portfolio:
+  expected_max_equity_usd: 2500
+  minimum_cash_reserve_pct: 10
+  max_invested_pct: 90
+positions:
+  max_single_position_pct: 15
+  max_single_position_usd: 300
+  max_positions: 12
+  min_order_usd: 25
+activity:
+  max_new_gross_exposure_per_day_usd: 500
+  max_orders_per_day: 5
+  max_trades_per_symbol_per_day: 1
+loss_limits:
+  max_daily_drawdown_pct: 5
+  max_weekly_drawdown_pct: 10
+  max_peak_to_trough_drawdown_pct: 20
+instruments:
+  equities: true
+  etfs: true
+  options: false
+  crypto: false
+  shorting: false
+  margin: false
+  leveraged_etfs: false
+  inverse_etfs: false
+  otc: false
+  penny_stocks: false
+orders:
+  extended_hours: false
+  allow_market_orders: false
+  default_order_type: limit
+  max_limit_slippage_bps: 50
+liquidity:
+  min_price_usd: 5
+  min_average_daily_dollar_volume_usd: 5000000
+  market_data_max_age_seconds: 900
+circuit_breakers:
+  reject_if_broker_state_unknown: true
+  reject_if_market_data_stale: true
+  reject_if_database_write_fails: true
+  reject_if_open_order_state_unknown: true
