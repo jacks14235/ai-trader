@@ -43,9 +43,10 @@ roles:
       - candidate_overview
       - deep_research
       - recent_decisions
+      - open_theses
     max_context_chars: 220000
     max_document_chars: 7000
-    max_output_chars: 50000
+    max_output_chars: 80000
     timeout_seconds: 900
     permissions:
       filesystem: read-only
@@ -77,7 +78,8 @@ roles:
       can_mutate_knowledge: false
 
   weekly_strategist:
-    enabled: false
+    # Also requires TRADER_STRATEGIST_ENABLED=true; the role only ever proposes, never applies.
+    enabled: true
     profile: deep
     prompt: prompts/weekly_strategist.md
     context_sources:

@@ -3,6 +3,7 @@
 import json
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, cast
 from zoneinfo import ZoneInfo
 
@@ -12,11 +13,28 @@ from sqlalchemy.orm import Session
 
 from trader.agent.config import load_agent_config
 from trader.agent.event_runner import event_run
+from trader.agent.invocation import workflow_trail
 from trader.agent.runner import daily_run
 from trader.agent.runtime import configured_daily_reasoning_pipeline
+from trader.agent.weekly import apply_anchored_change
+from trader.agent.weekly_runner import configured_weekly_review
+from trader.books.runtime import book_ledger, configured_book_evaluation_pipeline
+from trader.books.service import (
+    get_book,
+    list_books,
+    load_book_state,
+    open_book,
+    set_book_status,
+)
 from trader.broker.alpaca import AlpacaPaperBroker
 from trader.execution.canary import paper_canary
 from trader.execution.reconciliation import Reconciler
+from trader.ledger.knowledge import (
+    get_strategy_proposal,
+    pending_strategy_proposals,
+    resolve_strategy_proposal,
+)
+from trader.ledger.strategy import strategy_content_hash
 from trader.logging.audit import audit
 from trader.persistence.db import create_session_factory
 from trader.persistence.models import MarketEvent, Run
@@ -46,12 +64,16 @@ schedule_app = typer.Typer()
 universe_app = typer.Typer()
 research_app = typer.Typer()
 agents_app = typer.Typer()
+strategy_app = typer.Typer()
+books_app = typer.Typer()
 app.add_typer(runs_app, name="runs")
 app.add_typer(events_app, name="events")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(universe_app, name="universe")
 app.add_typer(research_app, name="research")
 app.add_typer(agents_app, name="agents")
+app.add_typer(strategy_app, name="strategy")
+app.add_typer(books_app, name="books")
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -191,6 +213,11 @@ def daily_run_command(
             candidate_scanner=universe_scanner_service(settings),
             research_pipeline=research_pipeline_service(settings, session),
             reasoning_pipeline=configured_daily_reasoning_pipeline(settings, session),
+            book_evaluation_pipeline=configured_book_evaluation_pipeline(
+                settings,
+                session,
+                broker,
+            ),
             risk_execution_pipeline=risk_execution_pipeline_service(
                 settings,
                 session,
@@ -200,6 +227,230 @@ def daily_run_command(
             test_rerun=test_rerun,
         )
     )
+
+
+@app.command("weekly-run")
+def weekly_run_command(
+    as_of: Annotated[
+        str | None,
+        typer.Option("--as-of", help="ISO timestamp to review as of; defaults to now."),
+    ] = None,
+    test_rerun: Annotated[
+        bool,
+        typer.Option(
+            "--test-rerun",
+            help="Run an additional uniquely keyed review without deleting the week's audit.",
+        ),
+    ] = False,
+) -> None:
+    """Review the completed week and record a strategy proposal for human review."""
+    settings, session = database_service()
+    result = configured_weekly_review(
+        settings,
+        session,
+        as_of=None if as_of is None else _aware_datetime(as_of, "--as-of"),
+        test_rerun=test_rerun,
+    )
+    typer.echo(json.dumps(result.summary(), indent=2))
+
+
+@strategy_app.command("proposals")
+def list_strategy_proposals() -> None:
+    """List strategy changes awaiting a human decision."""
+    _settings, session = database_service()
+    proposals = pending_strategy_proposals(session)
+    if not proposals:
+        typer.echo("No strategy proposals are awaiting review.")
+        return
+    for proposal in proposals:
+        typer.echo(f"{proposal.change_id} {proposal.created_at.isoformat()} {proposal.run_id}")
+
+
+@strategy_app.command("show")
+def show_strategy_proposal(change_id: str) -> None:
+    """Show one pending proposal as an applicable before/after diff."""
+    _settings, session = database_service()
+    typer.echo(json.dumps(get_strategy_proposal(session, change_id).summary(), indent=2))
+
+
+@strategy_app.command("approve")
+def approve_strategy_proposal(
+    change_id: str,
+    reviewer: Annotated[str, typer.Option("--reviewer", help="Who is approving this change.")],
+    note: Annotated[str, typer.Option("--note")] = "",
+) -> None:
+    """Apply an approved proposal to the strategy document and record the decision."""
+    settings, session = database_service()
+    proposal = get_strategy_proposal(session, change_id)
+    updated = apply_anchored_change(
+        settings.trader_strategy_document.read_text(encoding="utf-8"),
+        current_text=proposal.current_text,
+        replacement_text=proposal.replacement_text,
+    )
+    settings.trader_strategy_document.write_text(updated, encoding="utf-8")
+    resolution = resolve_strategy_proposal(
+        session,
+        proposal=proposal,
+        approved=True,
+        reviewer=reviewer,
+        note=note,
+        as_of=datetime.now(UTC),
+        applied_content_hash=strategy_content_hash(updated),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "change_id": change_id,
+                "resolution_id": resolution,
+                "applied_to": str(settings.trader_strategy_document),
+                "content_hash": strategy_content_hash(updated),
+            },
+            indent=2,
+        )
+    )
+
+
+@strategy_app.command("reject")
+def reject_strategy_proposal(
+    change_id: str,
+    reviewer: Annotated[str, typer.Option("--reviewer", help="Who is rejecting this change.")],
+    note: Annotated[str, typer.Option("--note")] = "",
+) -> None:
+    """Record a rejected proposal without touching the strategy document."""
+    _settings, session = database_service()
+    proposal = get_strategy_proposal(session, change_id)
+    resolution = resolve_strategy_proposal(
+        session,
+        proposal=proposal,
+        approved=False,
+        reviewer=reviewer,
+        note=note,
+        as_of=datetime.now(UTC),
+    )
+    typer.echo(json.dumps({"change_id": change_id, "resolution_id": resolution}, indent=2))
+
+
+@books_app.command("list")
+def list_books_command(
+    status: Annotated[str | None, typer.Option("--status")] = None,
+) -> None:
+    """List simulated strategy books and their derived cash and positions."""
+    _settings, session = database_service()
+    books = list_books(session, status=status)
+    if not books:
+        typer.echo("No simulated books are recorded.")
+        return
+    rows = []
+    for book in books:
+        state = load_book_state(session, book)
+        rows.append(
+            {
+                "name": book.name,
+                "status": book.status,
+                "starting_cash": book.starting_cash,
+                "cash": str(state.cash),
+                "positions": [
+                    {
+                        "symbol": position.symbol,
+                        "qty": str(position.qty),
+                        "average_entry_price": str(position.average_entry_price),
+                    }
+                    for position in state.positions
+                ],
+                "realized_pnl": str(state.realized_pnl),
+                "fill_count": state.fill_count,
+                "strategy_document_path": book.strategy_document_path,
+            }
+        )
+    typer.echo(json.dumps(rows, indent=2))
+
+
+@books_app.command("open")
+def open_book_command(
+    name: str,
+    cash: Annotated[str, typer.Option("--cash", help="Starting cash the book may invest.")],
+    strategy: Annotated[
+        Path,
+        typer.Option("--strategy", help="Path to the variant's strategy document."),
+    ],
+    description: Annotated[str | None, typer.Option("--description")] = None,
+) -> None:
+    """Open a simulated book. It never reaches the broker."""
+    try:
+        starting_cash = Decimal(cash)
+    except ArithmeticError as exc:
+        raise typer.BadParameter("cash must be a decimal number") from exc
+    _settings, session = database_service()
+    book = open_book(
+        session,
+        name=name,
+        starting_cash=starting_cash,
+        strategy_document_path=strategy,
+        description=description,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "book_id": book.id,
+                "name": book.name,
+                "status": book.status,
+                "starting_cash": book.starting_cash,
+                "strategy_document_path": book.strategy_document_path,
+                "strategy_content_hash": book.strategy_content_hash,
+            },
+            indent=2,
+        )
+    )
+
+
+@books_app.command("show")
+def show_book_command(name: str) -> None:
+    """Show one book's derived state and settled history."""
+    _settings, session = database_service()
+    book = get_book(session, name)
+    state = load_book_state(session, book)
+    typer.echo(
+        json.dumps(
+            {
+                **book_ledger(session, book),
+                "cash": str(state.cash),
+                "realized_pnl": str(state.realized_pnl),
+                "positions": [
+                    {
+                        "symbol": position.symbol,
+                        "qty": str(position.qty),
+                        "average_entry_price": str(position.average_entry_price),
+                    }
+                    for position in state.positions
+                ],
+            },
+            indent=2,
+        )
+    )
+
+
+@books_app.command("pause")
+def pause_book_command(name: str) -> None:
+    """Stop evaluating a book without discarding its history."""
+    _set_book_status(name, "paused")
+
+
+@books_app.command("resume")
+def resume_book_command(name: str) -> None:
+    """Return a paused book to the daily evaluation roster."""
+    _set_book_status(name, "active")
+
+
+@books_app.command("retire")
+def retire_book_command(name: str) -> None:
+    """Permanently stop a book. Its history remains for comparison."""
+    _set_book_status(name, "retired")
+
+
+def _set_book_status(name: str, status: str) -> None:
+    _settings, session = database_service()
+    book = set_book_status(session, get_book(session, name), status)
+    typer.echo(json.dumps({"name": book.name, "status": book.status}, indent=2))
 
 
 @agents_app.command("validate")
@@ -344,6 +595,20 @@ def show_run(run_id: str) -> None:
                 "run_key": run.run_key,
                 "status": run.status,
                 "error": run.error_summary,
+                "agents": [
+                    {
+                        "invocation_id": invocation.id,
+                        "role": invocation.role,
+                        "step": invocation.step,
+                        "attempt": invocation.attempt,
+                        "parent_invocation_id": invocation.parent_invocation_id,
+                        "status": invocation.status,
+                        "request_path": invocation.request_path,
+                        "response_path": invocation.response_path,
+                        "error": invocation.error_summary,
+                    }
+                    for invocation in workflow_trail(session, run.id)
+                ],
             },
             indent=2,
         )

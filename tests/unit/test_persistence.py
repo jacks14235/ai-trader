@@ -259,6 +259,7 @@ def test_invocation_evidence_is_ordered_idempotent_and_in_audit_trail(tmp_path):
     invocation = AgentInvocation(
         id="invocation-1",
         run_id=run.id,
+        role="test",
         purpose="research synthesis",
         model="not-active",
         provider="test",
@@ -310,6 +311,7 @@ def test_invocation_evidence_must_come_from_the_same_run(tmp_path):
     )
     invocation = AgentInvocation(
         run_id=run.id,
+        role="test",
         purpose="research synthesis",
         model="not-active",
         provider="test",
@@ -404,6 +406,115 @@ def test_research_migration_preserves_legacy_rows_and_downgrades(tmp_path):
         column["name"] for column in inspector.get_columns("research_items")
     }
     assert "research_item_symbols" not in inspector.get_table_names()
+
+
+def test_invocation_workflow_migration_derives_roles_and_guards_the_downgrade(tmp_path):
+    database_path = tmp_path / "flat.sqlite"
+    database_url = f"sqlite:///{database_path}"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "c4b3e2a19f70")
+    engine = create_engine(database_url)
+    timestamp = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO runs "
+                "(id, run_key, mode, scheduled_for, started_at, status, config_hash) "
+                "VALUES ('flat-run', 'daily:flat', 'paper', :scheduled, :started, "
+                "'COMPLETED', 'hash')"
+            ),
+            {"scheduled": timestamp, "started": timestamp},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_invocations "
+                "(id, run_id, purpose, model, provider, prompt_version, request_path, "
+                "started_at, status) "
+                "VALUES ('flat-invocation', 'flat-run', 'daily_trader_paper_proposal', "
+                "'codex-cli-default', 'codex_cli', 'hash', 'agent/daily_trader/request.json', "
+                ":started, 'COMPLETED')"
+            ),
+            {"started": timestamp},
+        )
+
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        migrated = connection.execute(
+            text(
+                "SELECT role, step, attempt, parent_invocation_id "
+                "FROM agent_invocations WHERE id = 'flat-invocation'"
+            )
+        ).one()
+    assert tuple(migrated) == ("daily_trader", "", 1, None)
+
+    command.downgrade(config, "c4b3e2a19f70")
+    assert "role" not in {
+        column["name"] for column in inspect(engine).get_columns("agent_invocations")
+    }
+
+    command.upgrade(config, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO agent_invocations "
+                "(id, run_id, role, step, attempt, purpose, model, provider, prompt_version, "
+                "request_path, started_at, status) "
+                "VALUES ('packet', 'flat-run', 'research_compactor', 'packet', 1, "
+                "'research_compactor_paper_proposal', 'codex-cli-default', 'codex_cli', 'hash', "
+                "'agent/research_compactor/packet/request.json', :started, 'COMPLETED')"
+            ),
+            {"started": timestamp},
+        )
+
+    with pytest.raises(RuntimeError, match="record a workflow position"):
+        command.downgrade(config, "c4b3e2a19f70")
+
+
+def test_strategy_attribution_migration_round_trips_and_guards_attributed_runs(tmp_path):
+    database_path = tmp_path / "unversioned.sqlite"
+    database_url = f"sqlite:///{database_path}"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "a1f4c2d90b57")
+    engine = create_engine(database_url)
+    timestamp = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO runs "
+                "(id, run_key, mode, scheduled_for, started_at, status, config_hash) "
+                "VALUES ('older-run', 'daily:older', 'paper', :scheduled, :started, "
+                "'COMPLETED', 'hash')"
+            ),
+            {"scheduled": timestamp, "started": timestamp},
+        )
+
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT strategy_id FROM runs WHERE id = 'older-run'")
+        ).scalar_one() is None
+
+    # An unattributed database can still be rolled back.
+    command.downgrade(config, "a1f4c2d90b57")
+    assert "strategy_id" not in {column["name"] for column in inspect(engine).get_columns("runs")}
+
+    command.upgrade(config, "head")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO strategies "
+                "(id, name, content_hash, status, description, created_at, updated_at) "
+                "VALUES ('strategy-1', 'strategy@abc', :hash, 'active', 'text', "
+                ":created, :created)"
+            ),
+            {"hash": "a" * 64, "created": timestamp},
+        )
+        connection.execute(text("UPDATE runs SET strategy_id = 'strategy-1'"))
+
+    with pytest.raises(RuntimeError, match="attributed to a strategy version"):
+        command.downgrade(config, "a1f4c2d90b57")
 
 
 def _session_and_run(tmp_path):

@@ -8,14 +8,23 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from trader.agent.models import TradeProposal
-from trader.agent.reasoning import DailyDecision
+from trader.agent.reasoning import DailyDecision, DailyUpdate
 from trader.agent.runner import daily_run, paper_test_run_key, run_key
 from trader.agent.runtime import DailyReasoningResult
 from trader.broker.models import Account, BrokerFill, BrokerOrder, OrderQueryStatus, Position
 from trader.persistence.db import create_session_factory
-from trader.persistence.models import Run, RunEvent
+from trader.persistence.models import (
+    DailyReport,
+    PerformanceSnapshot,
+    Run,
+    RunEvent,
+    Thesis,
+    TradeProposalRecord,
+)
+from trader.persistence.repositories import persist_trade_proposal
 from trader.research.artifacts import ResearchArtifact
 from trader.research.collection import ResearchCollection
 from trader.research.models import ResearchPlan, ResearchRequest
@@ -178,24 +187,55 @@ class FakeResearchPipeline:
 
 
 class FakeDailyReasoningPipeline:
-    def run(self, **_kwargs: object) -> DailyReasoningResult:
-        proposal = TradeProposal(
+    def __init__(self, session: Session | None = None) -> None:
+        self.session = session
+        self.proposal = TradeProposal(
             symbol="SPY",
             action="BUY",
             target_notional_usd=Decimal("25"),
             confidence=0.8,
             time_horizon="days",
             rationale="bounded runner test",
+            invalidation_conditions=["Support fails"],
             evidence_ids=["a" * 64],
             max_acceptable_price=Decimal("650"),
         )
+
+    def run(self, **kwargs: object) -> DailyReasoningResult:
+        if self.session is not None:
+            persist_trade_proposal(self.session, str(kwargs["run_id"]), self.proposal)
         return DailyReasoningResult(
             invocation_id="invocation",
             decision=DailyDecision(
                 status="PROPOSE_TRADES",
                 market_assessment="A bounded setup exists.",
                 strongest_counterargument="It may reverse.",
-                proposals=(proposal,),
+                daily_update=DailyUpdate.model_validate(
+                    {
+                        "headline": "Buying a small slice of the market, slowly",
+                        "lesson_title": (
+                            "A share is a piece of a business, not a lottery ticket"
+                        ),
+                        "lesson": (
+                            "SPY is a basket of large U.S. companies. Buying a little of it "
+                            "is a way to own a diversified slice rather than one story."
+                        ),
+                        "overview": (
+                            "The paper trader proposed a small SPY purchase on today's evidence."
+                        ),
+                        "next_day_plan": (
+                            "Check whether the order was allowed and whether "
+                            "the thesis still holds."
+                        ),
+                        "glossary": [
+                            {
+                                "term": "Equity",
+                                "definition": "The current value of cash plus holdings.",
+                            }
+                        ],
+                    }
+                ),
+                proposals=(self.proposal,),
             ),
             context_hash="b" * 64,
             prompt_hash="c" * 64,
@@ -278,7 +318,9 @@ def test_daily_run_persists_no_action_artifacts(tmp_path) -> None:
     assert set(manifest) == {
         "account_before.json",
         "daily_report.md",
+        "daily_update.html",
         "dynamic_runs_config.yaml",
+        "ledger_summary.json",
         "open_orders_before.json",
         "positions_before.json",
         "reconciliation_before.json",
@@ -286,7 +328,27 @@ def test_daily_run_persists_no_action_artifacts(tmp_path) -> None:
         "universe_config.yaml",
     }
     assert "NO_ACTION" in (directory / "daily_report.md").read_text()
+    html = (directory / "daily_update.html").read_text()
+    assert "The paper account was checked, but no model wrote the story" in html
+    assert "<svg" in html
+    assert "Beginner-facing HTML" in (directory / "daily_report.md").read_text()
     assert json.loads((directory / "open_orders_before.json").read_text()) == []
+
+    report_record = session.scalar(select(DailyReport).where(DailyReport.run_id == run_id))
+    assert report_record is not None
+    assert report_record.report_path == "daily_report.md"
+    assert report_record.content_hash == hashlib.sha256(
+        (directory / "daily_report.md").read_bytes()
+    ).hexdigest()
+    assert "NO_ACTION" in (report_record.summary or "")
+
+    performance = session.scalar(
+        select(PerformanceSnapshot).where(PerformanceSnapshot.run_id == run_id)
+    )
+    assert performance is not None
+    assert performance.equity == "2000"
+    assert performance.pnl is None
+    assert performance.drawdown_pct == "0"
 
     stages = list(
         session.scalars(
@@ -495,3 +557,55 @@ def test_test_rerun_can_evaluate_but_never_enables_execution(tmp_path: Path) -> 
     ) is not None
     report = (tmp_path / "raw" / "paper" / "runs" / run_id / "daily_report.md").read_text()
     assert "Paper orders submitted: 0" in report
+
+
+def test_daily_run_opens_a_thesis_for_every_authorized_proposal(tmp_path: Path) -> None:
+    session = create_session_factory(f"sqlite:///{tmp_path}/trader.db")()
+    reasoning_pipeline = FakeDailyReasoningPipeline(session)
+
+    run_id = daily_run(
+        session,
+        FakeBroker(),
+        tmp_path / "raw",
+        b"mode: paper\n",
+        datetime(2026, 8, 22, 14, tzinfo=UTC),
+        candidate_scanner=FakeCandidateScanner(),
+        research_pipeline=FakeResearchPipeline(),
+        reasoning_pipeline=reasoning_pipeline,
+        risk_execution_pipeline=FakeRiskExecutionPipeline(),
+        research_event_symbols=("SPY",),
+    )
+
+    thesis = session.scalar(select(Thesis))
+    assert thesis is not None
+    assert thesis.symbol == "SPY"
+    assert thesis.status == "active"
+    assert thesis.confidence == pytest.approx(0.8)
+    record = session.get(
+        TradeProposalRecord,
+        str(reasoning_pipeline.proposal.proposal_id),
+    )
+    assert record is not None
+    assert record.thesis_id == thesis.id
+
+    ledger_event = session.scalar(
+        select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.stage == "RECORD_DECISION_LEDGER",
+        )
+    )
+    assert ledger_event is not None
+    metadata = json.loads(ledger_event.metadata_json or "{}")
+    assert metadata["opened_theses"] == [thesis.id]
+    # The cited ID is not a persisted research row in this run, so no link may be forged.
+    assert metadata["linked_evidence_count"] == 0
+    assert metadata["unlinked_evidence_count"] == 1
+
+    directory = tmp_path / "raw" / "paper" / "runs" / run_id
+    assert "Theses opened: 1" in (directory / "daily_report.md").read_text()
+    assert json.loads((directory / "ledger_summary.json").read_text()) == metadata
+    html = (directory / "daily_update.html").read_text()
+    assert "Buying a small slice of the market, slowly" in html
+    assert "Risk approved" in html
+    assert "A share is a piece of a business" in html
+    assert "&lt;script" not in html

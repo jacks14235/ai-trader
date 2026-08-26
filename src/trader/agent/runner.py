@@ -4,17 +4,35 @@ import hashlib
 import json
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
+from trader.agent.briefing import (
+    DailyBriefingFacts,
+    load_daily_update_template,
+    render_daily_update,
+)
 from trader.agent.runtime import DailyReasoningPipeline
+from trader.books.runtime import BookEvaluationPipeline, BookEvaluationResult
 from trader.broker.base import Broker
 from trader.broker.models import Account
 from trader.execution.reconciliation import Reconciler
+from trader.ledger.history import load_equity_curve
+from trader.ledger.models import PerformanceMetrics
+from trader.ledger.service import (
+    close_theses_without_positions,
+    record_decision_ledger,
+    record_performance_snapshot,
+    record_run_report,
+    snapshot_peak_equity,
+)
+from trader.ledger.strategy import attribute_run_to_strategy, record_strategy_version
 from trader.logging.audit import audit
+from trader.persistence.models import PerformanceSnapshot
 from trader.persistence.repositories import claim_run, event, snapshot
 from trader.research.service import ResearchPipeline
 from trader.risk.runtime import DailyRiskExecutionPipeline
@@ -100,6 +118,7 @@ def daily_run(
     research_pipeline: ResearchPipeline | None = None,
     reasoning_pipeline: DailyReasoningPipeline | None = None,
     risk_execution_pipeline: DailyRiskExecutionPipeline | None = None,
+    book_evaluation_pipeline: BookEvaluationPipeline | None = None,
     research_event_symbols: tuple[str, ...] = (),
     test_rerun: bool = False,
 ) -> str:
@@ -189,6 +208,27 @@ def daily_run(
             (directory / "agents_config.yaml").write_bytes(agents_config_bytes)
         if strategy_bytes is not None:
             (directory / "strategy.md").write_bytes(strategy_bytes)
+            strategy_version = record_strategy_version(
+                session,
+                document=strategy_bytes.decode(),
+                as_of=when,
+                markdown_path="knowledge/strategy.md",
+            )
+            attribute_run_to_strategy(
+                session,
+                run_id=run.id,
+                strategy_id=strategy_version.strategy_id,
+            )
+            event(
+                session,
+                run.id,
+                "RECORD_STRATEGY_VERSION",
+                metadata={
+                    "strategy_id": strategy_version.strategy_id,
+                    "name": strategy_version.name,
+                    "content_hash": strategy_version.content_hash,
+                },
+            )
         if portfolio_policy_bytes is not None:
             (directory / "portfolio_policy.md").write_bytes(portfolio_policy_bytes)
 
@@ -208,6 +248,21 @@ def daily_run(
         event(session, run.id, "TAKE_PORTFOLIO_SNAPSHOT")
 
         event(session, run.id, "CHECK_CIRCUIT_BREAKERS")
+
+        # Safe only because open orders have already been refused: a symbol without a position
+        # and without a pending order is genuinely no longer held.
+        abandoned_theses = close_theses_without_positions(
+            session,
+            run_id=run.id,
+            held_symbols=frozenset(position.symbol for position in positions),
+            as_of=when,
+        )
+        event(
+            session,
+            run.id,
+            "RECONCILE_OPEN_THESES",
+            metadata={"closed_thesis_ids": list(abandoned_theses)},
+        )
 
         candidate_scan = None
         if candidate_scanner is not None:
@@ -351,7 +406,108 @@ def daily_run(
         else:
             event(session, run.id, "RISK_EXECUTION_SKIPPED_NO_REASONING")
 
+        book_result: BookEvaluationResult | None = None
+        if book_evaluation_pipeline is not None:
+            if candidate_scan is None or research_result is None:
+                event(
+                    session,
+                    run.id,
+                    "BOOK_EVALUATION_SKIPPED_NO_RESEARCH",
+                    "Simulated books reuse the run's slate and research; neither was available",
+                )
+            else:
+                book_result = book_evaluation_pipeline.run(
+                    run_id=run.id,
+                    run_directory=directory,
+                    as_of=when,
+                    scan=candidate_scan,
+                    research=research_result,
+                    allowed_symbols=frozenset(
+                        {candidate.symbol for candidate in candidate_scan.candidates}
+                        | {position.symbol for position in positions}
+                    ),
+                )
+                event(
+                    session,
+                    run.id,
+                    "EVALUATE_SIMULATED_BOOKS",
+                    metadata=book_result.summary(),
+                )
+        else:
+            event(session, run.id, "NO_SIMULATED_BOOKS_CONFIGURED")
+
+        ledger_summary = record_decision_ledger(
+            session,
+            run_id=run.id,
+            as_of=when,
+            proposals=(
+                () if reasoning_result is None else reasoning_result.decision.proposals
+            ),
+            approved_proposal_ids=frozenset(
+                ()
+                if risk_result is None
+                else (
+                    str(decision.proposal_id)
+                    for decision in risk_result.decisions
+                    if decision.approved
+                )
+            ),
+        )
+        _write_json(directory / "ledger_summary.json", ledger_summary.summary())
+        event(
+            session,
+            run.id,
+            "RECORD_DECISION_LEDGER",
+            metadata=ledger_summary.summary(),
+        )
+
+        performance = record_performance_snapshot(
+            session,
+            run_id=run.id,
+            account=account,
+            as_of=when,
+        )
+        event(
+            session,
+            run.id,
+            "RECORD_PERFORMANCE_SNAPSHOT",
+            metadata={
+                "equity": performance.equity,
+                "pnl": performance.pnl,
+                "return_pct": performance.return_pct,
+                "drawdown_pct": performance.drawdown_pct,
+            },
+        )
+
         trading_date = when.astimezone(SCHEDULE_ZONE).date()
+        (directory / "daily_update.html").write_text(
+            render_daily_update(
+                load_daily_update_template(),
+                DailyBriefingFacts(
+                    trading_date=trading_date,
+                    test_rerun=test_rerun,
+                    account=account,
+                    positions=tuple(positions),
+                    performance=_briefing_performance(performance),
+                    equity_curve=load_equity_curve(session),
+                    decision=(
+                        None if reasoning_result is None else reasoning_result.decision
+                    ),
+                    risk_decisions=(
+                        () if risk_result is None else risk_result.decisions
+                    ),
+                    submitted_orders=(
+                        () if risk_result is None else risk_result.submitted_orders
+                    ),
+                    execution_enabled=(
+                        None if risk_result is None else risk_result.execution_enabled
+                    ),
+                    ledger=ledger_summary,
+                    abandoned_thesis_count=len(abandoned_theses),
+                ),
+            ),
+            encoding="utf-8",
+        )
         decision_text = "NO_ACTION — agent reasoning is disabled."
         if reasoning_result is not None:
             if reasoning_result.decision.status == "NO_ACTION":
@@ -420,6 +576,40 @@ def daily_run(
                 report += f"- {decision.proposal_id}: {outcome} ({codes})\n"
         elif reasoning_result is not None:
             report += "Broker execution was not configured.\n"
+        if book_result is not None:
+            report += (
+                "\n## Simulated books\n"
+                f"Evaluated: {len(book_result.summaries)}\n"
+                f"Isolated failures: {len(book_result.failures)}\n"
+            )
+            for summary in book_result.summaries:
+                report += (
+                    f"- {summary.name}: {summary.decision_status}, "
+                    f"{summary.approved_count} approved, {summary.filled_count} filled, "
+                    f"equity ${summary.equity}\n"
+                )
+            for failure in book_result.failures:
+                report += f"- {failure.book_name}: FAILED ({failure.reason})\n"
+        report += (
+            "\n## Daily briefing\n"
+            "Beginner-facing HTML: `daily_update.html`\n"
+        )
+        report += (
+            "\n## Decision ledger\n"
+            f"Theses opened: {len(ledger_summary.opened_thesis_ids)}\n"
+            f"Theses updated: {len(ledger_summary.updated_thesis_ids)}\n"
+            f"Theses closed on exit: {len(ledger_summary.closed_thesis_ids)}\n"
+            f"Theses closed without a position: {len(abandoned_theses)}\n"
+            f"Evidence links added: {ledger_summary.linked_evidence_count}\n"
+        )
+        report += (
+            "\n## Performance\n"
+            f"Equity: ${performance.equity}\n"
+            f"Peak equity to date: ${snapshot_peak_equity(performance)}\n"
+            f"Change since prior run: {performance.pnl or 'n/a'} "
+            f"({performance.return_pct or 'n/a'}%)\n"
+            f"Drawdown from peak: {performance.drawdown_pct}%\n"
+        )
         if paper_options_exception:
             report += (
                 "\n## Broker safety exception\n"
@@ -427,6 +617,13 @@ def daily_run(
                 "by the local equity-only risk policy.\n"
             )
         (directory / "daily_report.md").write_text(report, encoding="utf-8")
+        record_run_report(
+            session,
+            run_id=run.id,
+            report_path="daily_report.md",
+            content=report,
+            summary=decision_text,
+        )
         event(session, run.id, "WRITE_DAILY_REPORT")
 
         manifest = {
@@ -456,3 +653,16 @@ def daily_run(
             error=str(exc),
         )
         raise
+
+
+def _briefing_performance(record: PerformanceSnapshot) -> PerformanceMetrics:
+    return PerformanceMetrics(
+        equity=Decimal(record.equity),
+        cash=Decimal("0") if record.cash is None else Decimal(record.cash),
+        peak_equity=snapshot_peak_equity(record),
+        drawdown_pct=(
+            Decimal("0") if record.drawdown_pct is None else Decimal(record.drawdown_pct)
+        ),
+        pnl=None if record.pnl is None else Decimal(record.pnl),
+        return_pct=None if record.return_pct is None else Decimal(record.return_pct),
+    )

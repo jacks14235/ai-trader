@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     trader_strategy_document: Path = Path("knowledge/strategy.md")
     trader_portfolio_policy: Path = Path("knowledge/portfolio_policy.md")
     trader_reasoning_enabled: bool = False
+    trader_strategist_enabled: bool = False
     trader_raw_data_dir: Path = Path("data/raw")
     stop_trading_file: Path = Path("STOP_TRADING")
     market_data_max_age_seconds: int = 900

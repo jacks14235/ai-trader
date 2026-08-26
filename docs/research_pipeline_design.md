@@ -1,6 +1,7 @@
 # Research Pipeline Design
 
-Status: initial Alpaca + SEC shadow-collection slice implemented; reasoning and web enrichment remain.
+Status: Alpaca + SEC single-pass collection and daily-trader reasoning are implemented. Evidence
+synthesis, model-requested follow-up research, and web/paid enrichment remain.
 
 ## Objective
 
@@ -86,10 +87,50 @@ and admitted providers.
 6. Implemented: collection inside `daily-run` in shadow mode, still producing `NO_ACTION`.
 7. Implemented: stubbed provider, duplicate, timestamp, budget, migration, and recursive-manifest tests.
 
-The next slice is evidence synthesis: build compact per-symbol packets from these retained documents,
-record the exact packet IDs supplied to a reasoning model, and validate a structured `NO_ACTION` or
-trade-proposal response. General web discovery and optional paid/x402 providers should follow behind
-the same bounded evidence contract rather than being exposed as unrestricted model tools.
+## Depth without unbounded tools
 
-Only after those artifacts can be replayed exactly should an LLM planner/synthesizer and structured
-trade proposals be connected.
+Depth should come from more rounds of *deterministically executed* collection, never from handing a
+model a live network tool. Three additions get most of the available depth.
+
+### 1. Evidence packets (research compactor)
+
+Today `assemble_daily_context` truncates raw `normalized_text` to fit a character budget, so the
+daily trader competes for context with boilerplate. A compactor pass should turn retained documents
+into per-symbol packets that keep facts, attributed source claims, contradictions, and freshness
+while dropping repetition. Packets are themselves hashed artifacts with their own IDs, and every
+statement must carry the exact upstream `research_id`s so a packet never becomes a laundering step
+for uncited claims. Truncation then removes redundancy rather than evidence.
+
+### 2. Model-requested follow-up research
+
+A single deterministic pass cannot know which question matters until something has been read. Add a
+bounded second round:
+
+1. Round one collects the current deterministic plan.
+2. A research-planner role reads the round-one packets and returns a validated `ResearchRequest`
+   list: symbol, question type, and the specific gap or contradiction being resolved.
+3. Deterministic code rejects any request naming an unsupported symbol, an unadmitted provider, an
+   unknown question type, or a window outside the configured freshness policy. Surviving requests
+   are truncated to the remaining request, byte, item, and wall-clock budget of the *same* run.
+4. Round two collects only the surviving requests. Its documents receive run-scoped evidence IDs
+   exactly like round one.
+
+The model chooses *what to ask*; configuration still decides what may be fetched and how much. Round
+count is capped (two is enough to start) so the loop always terminates. Budgets must be accounted
+cumulatively across rounds, which the current single-pass validators do not do.
+
+### 3. New providers behind the same contract
+
+`ProviderName` is a closed `Literal["alpaca", "sec"]` and `admitted_providers` must currently equal
+exactly that set, so adding a source is a deliberate config and code change rather than a runtime
+capability. Keep it that way. A bounded web-fetch provider should retain the fetched page rather
+than a search snippet, cap page count and bytes per question, and record the resolved URL and
+retrieval time. Paid/x402 providers additionally need per-request and per-run spend caps enforced
+before the request, not after.
+
+## Measuring whether depth helps
+
+More context is not better research. Before expanding sources, record enough per run to answer
+whether research changed decisions: packet count and size, how many admitted evidence IDs were
+actually cited, how often follow-up requests were issued and granted, and whether cited evidence
+was primary or secondary. Without that, provider expansion is unfalsifiable.

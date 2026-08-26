@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -54,6 +55,10 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String, default="STARTED", index=True)
     git_commit_sha: Mapped[str | None] = mapped_column(String)
     config_hash: Mapped[str] = mapped_column(String)
+    strategy_id: Mapped[str | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="SET NULL"),
+        index=True,
+    )
     agent_model: Mapped[str | None] = mapped_column(String)
     prompt_version: Mapped[str | None] = mapped_column(String)
     raw_artifact_path: Mapped[str | None] = mapped_column(Text)
@@ -292,10 +297,13 @@ class ResearchItemQuestion(Base):
 
 
 class Strategy(Base):
+    """One immutable version of the human-owned strategy document, keyed by its content."""
+
     __tablename__ = "strategies"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     name: Mapped[str] = mapped_column(String, unique=True)
+    content_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
     status: Mapped[str] = mapped_column(String, default="active", index=True)
     description: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -368,11 +376,32 @@ class KnowledgeChange(Base):
 
 
 class AgentInvocation(Base):
+    """One model call, placed in its workflow so multi-step runs stay reconstructable."""
+
     __tablename__ = "agent_invocations"
-    __table_args__ = (Index("ix_agent_invocations_run_started", "run_id", "started_at"),)
+    __table_args__ = (
+        Index("ix_agent_invocations_run_started", "run_id", "started_at"),
+        Index("ix_agent_invocations_run_role", "run_id", "role"),
+        UniqueConstraint(
+            "run_id",
+            "role",
+            "step",
+            "attempt",
+            name="uq_agent_invocations_run_role_step_attempt",
+        ),
+        CheckConstraint("attempt >= 1", name="positive_attempt"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String)
+    # The empty string is the role's only step; named steps belong to multi-step workflows.
+    step: Mapped[str] = mapped_column(String, default="")
+    attempt: Mapped[int] = mapped_column(default=1)
+    parent_invocation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_invocations.id", ondelete="CASCADE"),
+        index=True,
+    )
     purpose: Mapped[str] = mapped_column(String)
     model: Mapped[str] = mapped_column(String)
     provider: Mapped[str] = mapped_column(String)
@@ -434,6 +463,12 @@ class TradeProposalRecord(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
     agent_invocation_id: Mapped[str | None] = mapped_column(
         ForeignKey("agent_invocations.id", ondelete="SET NULL"),
+        index=True,
+    )
+    # NULL is the live decision line. Readers of the live record must filter on this, or a
+    # variant's proposals would be mistaken for decisions the portfolio actually made.
+    book_id: Mapped[str | None] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"),
         index=True,
     )
     symbol: Mapped[str] = mapped_column(String, index=True)
@@ -553,16 +588,88 @@ class DailyReport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class Book(Base):
+    """A simulated portfolio owned by one strategy variant.
+
+    A book never reaches a broker. Its cash and positions are *derived* by replaying
+    ``simulated_fills`` from ``starting_cash``, so its state is reconstructable and cannot drift
+    from its own audit trail.
+    """
+
+    __tablename__ = "books"
+    __table_args__ = (
+        CheckConstraint("status in ('active','paused','retired')", name="book_status_valid"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    # A book owns its strategy document rather than pointing at a `strategies` row, because
+    # recording a variant as a strategy version would supersede the live line's active version.
+    # The content hash is the join key: a control book running the incumbent document shares its
+    # hash with the recorded version, and a divergent variant simply does not.
+    strategy_document_path: Mapped[str] = mapped_column(Text)
+    strategy_content_hash: Mapped[str] = mapped_column(String, index=True)
+    status: Mapped[str] = mapped_column(String, default="active", index=True)
+    starting_cash: Mapped[str] = mapped_column(String)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SimulatedFill(Base):
+    """One modeled execution against a book, with the quote that produced it.
+
+    The bid, ask, and assumptions are stored alongside the fill so a reviewer can see exactly what
+    market data and what modeling choices generated it, rather than trusting the resulting price.
+    """
+
+    __tablename__ = "simulated_fills"
+    __table_args__ = (
+        UniqueConstraint("book_id", "proposal_id"),
+        Index("ix_simulated_fills_book_time", "book_id", "transaction_time"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    book_id: Mapped[str] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    proposal_id: Mapped[str] = mapped_column(String, index=True)
+    symbol: Mapped[str] = mapped_column(String, index=True)
+    side: Mapped[str] = mapped_column(String)
+    qty: Mapped[str] = mapped_column(String)
+    price: Mapped[str] = mapped_column(String)
+    commission: Mapped[str] = mapped_column(String, default="0")
+    quote_bid: Mapped[str | None] = mapped_column(String)
+    quote_ask: Mapped[str | None] = mapped_column(String)
+    quote_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    assumptions_json: Mapped[str] = mapped_column(Text)
+    transaction_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class PerformanceSnapshot(Base):
     __tablename__ = "performance_snapshots"
     __table_args__ = (
-        UniqueConstraint("run_id", "period"),
+        UniqueConstraint("run_id", "period", "book_id"),
+        # SQLite treats NULLs as distinct in UNIQUE, so the live line needs its own index.
+        Index(
+            "uq_performance_snapshots_live_run_period",
+            "run_id",
+            "period",
+            unique=True,
+            sqlite_where=text("book_id IS NULL"),
+        ),
         Index("ix_performance_snapshots_captured", "captured_at"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     run_id: Mapped[str | None] = mapped_column(
         ForeignKey("runs.id", ondelete="SET NULL"),
+        index=True,
+    )
+    # NULL is the live paper account; a value scopes the snapshot to one simulated book.
+    book_id: Mapped[str | None] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"),
         index=True,
     )
     period: Mapped[str] = mapped_column(String, default="daily")

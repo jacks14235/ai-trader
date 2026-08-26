@@ -533,8 +533,13 @@ def persist_trade_proposal(
     proposal: TradeProposal,
     *,
     agent_invocation_id: str | None = None,
+    book_id: str | None = None,
 ) -> TradeProposalRecord:
-    """Persist a proposal once; identical retries return the original row."""
+    """Persist a proposal once; identical retries return the original row.
+
+    ``book_id`` records which decision line the proposal belongs to: ``None`` is the live
+    portfolio, a value is a simulated book.
+    """
     proposal_id = str(proposal.proposal_id)
     raw_json = proposal.model_dump_json()
     existing = session.get(TradeProposalRecord, proposal_id)
@@ -542,6 +547,7 @@ def persist_trade_proposal(
         _verify_same(
             existing.run_id == run_id
             and existing.agent_invocation_id == agent_invocation_id
+            and existing.book_id == book_id
             and _json_equal(existing.raw_json, raw_json),
             "trade proposal",
             proposal_id,
@@ -552,6 +558,7 @@ def persist_trade_proposal(
         id=proposal_id,
         run_id=run_id,
         agent_invocation_id=agent_invocation_id,
+        book_id=book_id,
         symbol=proposal.symbol,
         action=proposal.action,
         requested_notional=_optional_decimal(proposal.target_notional_usd),
@@ -572,6 +579,7 @@ def persist_trade_proposal(
         _verify_same(
             concurrent.run_id == run_id
             and concurrent.agent_invocation_id == agent_invocation_id
+            and concurrent.book_id == book_id
             and _json_equal(concurrent.raw_json, raw_json),
             "trade proposal",
             proposal_id,

@@ -15,15 +15,20 @@ from trader.agent.codex_cli import (
 from trader.agent.config import AgentConfig, ModelProfile, load_agent_config
 from trader.agent.models import TradeProposal
 from trader.agent.reasoning import (
+    DailyAgentContext,
     DailyDecision,
+    DailyUpdate,
     assemble_daily_context,
     validate_daily_decision,
+    verify_daily_context_sources,
 )
 from trader.agent.runtime import ShadowDailyReasoningPipeline
-from trader.broker.models import Account
+from trader.broker.models import Account, Position
+from trader.ledger.models import RecentRunDecision
+from trader.ledger.service import record_run_report
 from trader.persistence.db import create_session_factory
-from trader.persistence.models import AgentInvocation, Run, TradeProposalRecord
-from trader.persistence.repositories import persist_research_item
+from trader.persistence.models import AgentInvocation, Run, Thesis, TradeProposalRecord
+from trader.persistence.repositories import persist_research_item, persist_trade_proposal
 from trader.research.artifacts import ResearchArtifact
 from trader.research.collection import ResearchCollection
 from trader.research.models import ResearchPlan, ResearchRequest
@@ -81,6 +86,7 @@ def test_context_is_bounded_and_decision_must_use_admitted_evidence(tmp_path: Pa
         status="PROPOSE_TRADES",
         market_assessment="The evidence supports a bounded paper proposal.",
         strongest_counterargument="The observed move may reverse.",
+        daily_update=_briefing(),
         proposals=(
             TradeProposal(
                 proposal_id=uuid4(),
@@ -110,6 +116,155 @@ def test_context_is_bounded_and_decision_must_use_admitted_evidence(tmp_path: Pa
         validate_daily_decision(invented, context)
 
 
+def test_declaring_a_context_source_the_assembler_cannot_supply_fails_closed() -> None:
+    config = load_agent_config(PROJECT_ROOT / "config" / "agents.yaml")
+    role = config.roles["daily_trader"]
+    verify_daily_context_sources(role)
+
+    undelivered = role.model_copy(
+        update={"context_sources": (*role.context_sources, "weekly_performance")}
+    )
+    with pytest.raises(ValueError, match="weekly_performance"):
+        verify_daily_context_sources(undelivered)
+
+
+def test_context_supplies_prior_decisions_and_open_theses_as_memory(tmp_path: Path) -> None:
+    session, run, scan, research, research_id = _research_state(tmp_path)
+    prior = Run(
+        run_key="daily:2026-08-21",
+        scheduled_for=scan.as_of - timedelta(days=1),
+        config_hash="config",
+        status="COMPLETED",
+    )
+    thesis = Thesis(
+        symbol="SPY",
+        title="SPY — the regime still favors the benchmark",
+        status="active",
+        summary="Rationale: breadth keeps improving.",
+        confidence=0.55,
+        invalidation_json=json.dumps(["Breadth narrows"]),
+        created_at=scan.as_of - timedelta(days=1),
+        updated_at=scan.as_of - timedelta(days=1),
+    )
+    session.add_all([prior, thesis])
+    session.commit()
+    persist_trade_proposal(
+        session,
+        prior.id,
+        TradeProposal(
+            symbol="SPY",
+            action="BUY",
+            target_notional_usd="100",
+            confidence=0.55,
+            time_horizon="weeks",
+            rationale="Breadth keeps improving.",
+            evidence_ids=[],
+            max_acceptable_price="650",
+        ),
+    )
+    record_run_report(
+        session,
+        run_id=prior.id,
+        report_path="daily_report.md",
+        content="# Report\n",
+        summary="PROPOSE_TRADES: one entry authorized.",
+    )
+    config = load_agent_config(PROJECT_ROOT / "config" / "agents.yaml")
+
+    context = assemble_daily_context(
+        session,
+        run_id=run.id,
+        as_of=scan.as_of,
+        strategy="Strategy",
+        portfolio_policy="Policy",
+        account=Account(equity="2000", cash="2000", buying_power="2000"),
+        positions=(
+            Position(symbol="QQQ", qty="1", market_value="500", current_price="500"),
+        ),
+        open_orders=(),
+        scan=scan,
+        research=research,
+        role=config.roles["daily_trader"],
+    )
+
+    assert [record.run_key for record in context.recent_decisions] == ["daily:2026-08-21"]
+    assert context.recent_decisions[0].decision_summary == "PROPOSE_TRADES: one entry authorized."
+    assert [item.symbol for item in context.open_theses] == ["SPY"]
+    assert context.open_theses[0].thesis_id == thesis.id
+
+    def proposal(**overrides: object) -> DailyDecision:
+        return DailyDecision(
+            status="PROPOSE_TRADES",
+            market_assessment="The prior thesis still holds.",
+            strongest_counterargument="Breadth could narrow quickly.",
+            daily_update=_briefing(),
+            proposals=(
+                TradeProposal(
+                    symbol="SPY",
+                    action="BUY",
+                    target_notional_usd="100",
+                    confidence=0.6,
+                    time_horizon="weeks",
+                    rationale="Adding to the existing position.",
+                    evidence_ids=[research_id],
+                    max_acceptable_price="650",
+                    **overrides,  # type: ignore[arg-type]
+                ),
+            ),
+        )
+
+    continued = proposal(thesis_id=thesis.id)
+    assert validate_daily_decision(continued, context) is continued
+    with pytest.raises(ValueError, match="outside the supplied context"):
+        validate_daily_decision(proposal(thesis_id=uuid4()), context)
+
+    mismatched = continued.model_copy(
+        update={"proposals": (continued.proposals[0].model_copy(update={"symbol": "QQQ"}),)}
+    )
+    with pytest.raises(ValueError, match="belonging to another symbol"):
+        validate_daily_decision(mismatched, context)
+
+
+def test_context_refuses_decisions_that_postdate_the_cutoff(tmp_path: Path) -> None:
+    session, run, scan, research, _ = _research_state(tmp_path)
+    later = Run(
+        run_key="daily:2026-08-23",
+        scheduled_for=scan.as_of + timedelta(days=1),
+        config_hash="config",
+        status="COMPLETED",
+    )
+    session.add(later)
+    session.commit()
+    config = load_agent_config(PROJECT_ROOT / "config" / "agents.yaml")
+
+    context = assemble_daily_context(
+        session,
+        run_id=run.id,
+        as_of=scan.as_of,
+        strategy="Strategy",
+        portfolio_policy="Policy",
+        account=Account(equity="2000", cash="2000", buying_power="2000"),
+        positions=(),
+        open_orders=(),
+        scan=scan,
+        research=research,
+        role=config.roles["daily_trader"],
+    )
+
+    assert context.recent_decisions == ()
+
+    payload = context.model_dump()
+    payload["recent_decisions"] = (
+        RecentRunDecision(
+            run_id=later.id,
+            run_key=later.run_key,
+            scheduled_for=later.scheduled_for,
+        ).model_dump(),
+    )
+    with pytest.raises(ValueError, match="cannot postdate the context cutoff"):
+        DailyAgentContext.model_validate(payload)
+
+
 def test_shadow_pipeline_persists_invocation_and_never_executes(tmp_path: Path) -> None:
     session, run, scan, research, research_id = _research_state(tmp_path)
     config = load_agent_config(PROJECT_ROOT / "config" / "agents.yaml")
@@ -118,6 +273,7 @@ def test_shadow_pipeline_persists_invocation_and_never_executes(tmp_path: Path) 
         market_assessment="No sufficiently asymmetric setup.",
         strongest_counterargument="A short-term move remains possible.",
         no_action_reason="Evidence is insufficient.",
+        daily_update=_briefing(),
     ).model_dump_json()
     provider = FakeReasoningProvider(response)
     pipeline = ShadowDailyReasoningPipeline(
@@ -146,6 +302,11 @@ def test_shadow_pipeline_persists_invocation_and_never_executes(tmp_path: Path) 
     assert invocation is not None
     assert invocation.status == "COMPLETED"
     assert invocation.evidence_manifest_hash is not None
+    assert (invocation.role, invocation.step, invocation.attempt) == ("daily_trader", "", 1)
+    assert invocation.parent_invocation_id is None
+    assert invocation.purpose == "daily_trader_paper_proposal"
+    assert invocation.request_path == "agent/daily_trader/request.json"
+    assert invocation.response_path == "agent/daily_trader/response.json"
     assert research_id in provider.received_prompt
     assert session.query(TradeProposalRecord).count() == 0
     assert (run_directory / "agent" / "daily_trader" / "response.json").is_file()
@@ -192,6 +353,12 @@ def test_codex_output_schema_requires_every_property_and_removes_defaults() -> N
     assert schema["required"] == list(properties)
     definitions = schema["$defs"]
     assert isinstance(definitions, dict)
+    assert "DailyUpdate" in definitions
+    update = definitions["DailyUpdate"]
+    assert isinstance(update, dict)
+    update_properties = update["properties"]
+    assert isinstance(update_properties, dict)
+    assert update["required"] == list(update_properties)
     proposal = definitions["TradeProposal"]
     assert isinstance(proposal, dict)
     proposal_properties = proposal["properties"]
@@ -226,6 +393,18 @@ def test_codex_cli_surfaces_jsonl_error_when_stderr_is_empty(
 
     assert message in raised.value.stdout
     assert raised.value.stderr == ""
+
+
+def _briefing(**overrides: object) -> DailyUpdate:
+    payload: dict[str, object] = {
+        "headline": "Cash is still a position",
+        "lesson_title": "Waiting is a decision",
+        "lesson": "A portfolio that does not trade is still making a choice about risk.",
+        "overview": "No idea cleared the evidence bar, so the paper account stays as it is.",
+        "next_day_plan": "Look again at the same names only if the evidence changes.",
+    }
+    payload.update(overrides)
+    return DailyUpdate.model_validate(payload)
 
 
 def _research_state(

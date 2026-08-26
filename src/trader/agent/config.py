@@ -22,6 +22,7 @@ ContextSource = Literal[
     "deep_research",
     "scheduled_event",
     "recent_decisions",
+    "open_theses",
     "weekly_performance",
 ]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
@@ -141,6 +142,7 @@ class AgentConfig(AgentConfigModel):
                     "candidate_overview",
                     "deep_research",
                     "recent_decisions",
+                    "open_theses",
                 }
                 if not required.issubset(role.context_sources):
                     raise ValueError("daily_trader is missing a required context source")
