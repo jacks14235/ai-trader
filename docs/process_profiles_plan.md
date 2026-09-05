@@ -1,7 +1,7 @@
 # Process profiles: implementation plan
 
 Status: ready to implement. This is the brief for the next coding agent.
-Last updated: 2026-08-25.
+Last updated: 2026-09-03.
 
 ## Goal
 
@@ -31,6 +31,29 @@ prompts are not.
 - Event-trader context assembler / invoking `event_trader`.
 - Book theses, book equity in promotion logic, or changing `MAX_ACTIVE_BOOKS`.
 - Weakening paper-only, `can_submit_orders: Literal[False]`, or the risk engine.
+- Addressed dissent and process scoring (see Future work).
+
+## Future work (not this slice)
+
+These need packets and profiles to exist first. Do not add schema fields, scores,
+or extra daily-decision requirements for them now. Write a pointer into
+`docs/remaining_work.md` when this slice lands.
+
+### Addressed dissent
+
+The adversary is theater if the manager can ignore its packet with no trace.
+After profiles run, a `daily_decision` should have to name which consumed-packet
+contradictions it accepted or dismissed. That is how communication becomes
+checkable — a typed acknowledgment, not a chat thread. Until then, `consumes`
+only proves the memo was in context, not that it was read.
+
+### Score the process, not just the book
+
+The ledger already scores theses from fills. Once packets are real, score the
+pipeline the same way: which adversary warnings preceded losing trades, which
+packet claims landed in approved theses, and which catalogued profile is +EV
+when the strategy hash is held fixed. That is the learning loop. This slice
+only makes process a named, replayable object; it does not yet grade it.
 
 ## Design locks (do not relitigate)
 
