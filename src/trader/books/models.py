@@ -190,6 +190,25 @@ class SimulatedFillResult(BookModel):
         }
 
 
+class ReferencePointSummary(BookModel):
+    """Compact result of one deterministic comparison curve at a book cutoff."""
+
+    kind: Literal["CASH", "SPY_BUY_HOLD"]
+    status: Literal["COMPLETED", "FAILED"]
+    equity: Decimal | None = None
+    cash: Decimal | None = None
+    error: str | None = None
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "status": self.status,
+            "equity": None if self.equity is None else str(self.equity),
+            "cash": None if self.cash is None else str(self.cash),
+            "error": self.error,
+        }
+
+
 class BookRunSummary(BookModel):
     """What one book did in one run."""
 
@@ -197,7 +216,13 @@ class BookRunSummary(BookModel):
     name: str
     run_id: str
     invocation_id: str | None = None
+    process_profile: str = "single_pass"
+    experiment_phase_id: str | None = None
+    evaluation_id: str | None = None
+    invocation_trail: tuple[str, ...] = ()
     decision_status: str
+    abstention_classification: str | None = None
+    dissent_disposition_count: int = Field(default=0, ge=0)
     proposal_count: int = Field(default=0, ge=0)
     approved_count: int = Field(default=0, ge=0)
     rejected_count: int = Field(default=0, ge=0)
@@ -206,6 +231,7 @@ class BookRunSummary(BookModel):
     equity: Decimal
     cash: Decimal
     position_count: int = Field(default=0, ge=0)
+    references: tuple[ReferencePointSummary, ...] = ()
 
     def summary(self) -> dict[str, object]:
         return {
@@ -213,7 +239,13 @@ class BookRunSummary(BookModel):
             "name": self.name,
             "run_id": self.run_id,
             "invocation_id": self.invocation_id,
+            "process_profile": self.process_profile,
+            "experiment_phase_id": self.experiment_phase_id,
+            "evaluation_id": self.evaluation_id,
+            "invocation_trail": list(self.invocation_trail),
             "decision_status": self.decision_status,
+            "abstention_classification": self.abstention_classification,
+            "dissent_disposition_count": self.dissent_disposition_count,
             "proposal_count": self.proposal_count,
             "approved_count": self.approved_count,
             "rejected_count": self.rejected_count,
@@ -222,4 +254,5 @@ class BookRunSummary(BookModel):
             "equity": str(self.equity),
             "cash": str(self.cash),
             "position_count": self.position_count,
+            "references": [item.summary() for item in self.references],
         }

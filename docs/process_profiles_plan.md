@@ -1,119 +1,54 @@
-# Process profiles: implementation plan
+# Process profiles: simulated-book implementation contract
 
-Status: ready to implement. This is the brief for the next coding agent.
-Last updated: 2026-09-03.
+Last updated: 2026-09-13.
+Status: steps 1–6 are implemented and locally verified. The CEO section is a future specification
+and does not authorize implementing that workflow now.
 
-## Goal
+## Scope and boundaries
 
-Let books compete as **teams with different hypotheses and bounded process**, not as
-forks of the authorizer.
+Let simulated books run bounded research teams with named processes and reconstructable evidence.
+The current slice adds a catalog, packets, role-specific projections, composed book prompts, a
+profile executor, and book experiment records. It does not make the incumbent trading line use
+profiles. `ShadowDailyReasoningPipeline`, `DailyAgentContext`, the existing daily-trader prompt,
+and the incumbent invocation identity and execution gates remain unchanged.
 
-After this slice:
+All new capabilities run for simulated books only. Researchers cannot submit proposals or orders;
+only the terminal manager returns a `DailyDecision`, whose proposals still require deterministic
+risk authorization before simulated fills. No model or profile executor receives a `Broker`.
 
-- Pipelines are named **process profiles** in human-owned YAML.
-- A book (and the live line) runs a catalogued sequence of typed workflow steps
-  through the existing `invoke_role` primitive.
-- The weekly strategist (CEO) may propose a new book: strategy fork, catalog
-  profile, and an operating note. It must not author `prompts/*.md`, invent a DAG,
-  edit `risk.yaml`, or open the book itself.
-- Role **contracts** stay human-owned. Book **personality** is an appended operating
-  note, hashed onto the invocation.
+Keep decision contracts independent of collection and execution: caller-supplied context projectors
+and a terminal proposal-persistence callback compose the workflow; risk and simulation stay outside.
+That separation supports a later reviewed Alpaca paper integration. It does not enable real trading,
+shorts, options, margin, automatic book promotion, or any exception to current human-owned policy.
 
-Unorthodox interpretation is allowed. Unconstrained graphs and unconstrained system
-prompts are not.
+This original slice excluded addressed dissent and structured waiting; the subsequent decision-audit
+slice now implements both on terminal decisions. Forecasts and outcome resolution, model-requested
+collection, event-trader invocation, CEO book proposals, automatic instantiation, and scoring or
+promotion based on process performance remain out of scope. See [remaining work](remaining_work.md).
 
-## Non-goals (do not implement in this slice)
+## 1. Human-owned process catalog
 
-- Auto-opening or promoting a book from a weekly proposal.
-- Free-form DAGs, CEO-invented roles, or CEO-written files under `prompts/`.
-- Model-requested follow-up research (`ResearchRequest` loop). That is still blocked
-  on `docs/research_pipeline_design.md`.
-- Event-trader context assembler / invoking `event_trader`.
-- Book theses, book equity in promotion logic, or changing `MAX_ACTIVE_BOOKS`.
-- Weakening paper-only, `can_submit_orders: Literal[False]`, or the risk engine.
-- Addressed dissent and process scoring (see Future work).
+`src/trader/agent/catalog.py` loads strict, frozen models from `config/pipelines.yaml`. Roles define
+identity and permissions in `agents.yaml`; profiles define composition separately. Register the
+catalog setting and include effective catalog configuration in book experiment provenance.
+`trader agents validate` validates and reports both roles and profiles.
 
-## Future work (not this slice)
-
-These need packets and profiles to exist first. Do not add schema fields, scores,
-or extra daily-decision requirements for them now. Write a pointer into
-`docs/remaining_work.md` when this slice lands.
-
-### Addressed dissent
-
-The adversary is theater if the manager can ignore its packet with no trace.
-After profiles run, a `daily_decision` should have to name which consumed-packet
-contradictions it accepted or dismissed. That is how communication becomes
-checkable — a typed acknowledgment, not a chat thread. Until then, `consumes`
-only proves the memo was in context, not that it was read.
-
-### Score the process, not just the book
-
-The ledger already scores theses from fills. Once packets are real, score the
-pipeline the same way: which adversary warnings preceded losing trades, which
-packet claims landed in approved theses, and which catalogued profile is +EV
-when the strategy hash is held fixed. That is the learning loop. This slice
-only makes process a named, replayable object; it does not yet grade it.
-
-## Design locks (do not relitigate)
-
-1. **Control plane stays Python.** Evidence IDs, schema, permissions, risk, paper
-   mode. A prompt cannot bypass them. Do not add a content filter that rejects
-   "unorthodox" operating notes.
-2. **Role contract vs desk instructions.** `prompts/*.md` is the skeleton. An
-   optional operating note is appended. Composition is deterministic and audited
-   because `invoke_role` already hashes the full prompt text.
-3. **One terminal decision step.** Only a `daily_decision` step may persist
-   `TradeProposal`s. Researcher steps report packets. If the manager also plans,
-   that is a different named step with a different output type.
-4. **Named steps, parent links, no interrupts.** Profiles are an ordered list.
-   `consumes` must name earlier steps in the same profile. The executor sets
-   `WorkflowStep.parent_invocation_id` to the last consumed step (or `None` for
-   roots). Reconstruct from `workflow_trail`.
-5. **Shared factory.** Scan, collect, risk, ledger, simulator stay where they are.
-   Profiles only replace the "invoke one daily_trader" hole in
-   `ShadowDailyReasoningPipeline` and `BookEvaluationPipeline._invoke`.
-6. **Still one CEO action per weekly review.** `NO_CHANGE`, `PROPOSE_CHANGE`
-   (live strategy, existing), or `PROPOSE_BOOK` (new). Not all three.
-
-## Current code to reuse
-
-| Piece | Where | What to do |
-| --- | --- | --- |
-| `invoke_role` / `WorkflowStep` | `src/trader/agent/invocation.py` | Do not change the primitive. Compose pipelines on top. |
-| Role registry | `config/agents.yaml`, `src/trader/agent/config.py` | Add context sources; do not add a "CEO-authored prompt" field. |
-| Daily composition | `src/trader/agent/runtime.py` | Become a caller of the pipeline executor with the default profile. |
-| Book evaluation | `src/trader/books/runtime.py` | Run the book's profile; prefix step names; keep failure isolation. |
-| Compactor role | configured, **never invoked** | First consumer of a non-decide step. Needs a real output model. |
-| Weekly recommendation | `src/trader/agent/weekly.py` | Extend the discriminated status; keep one-action-per-review. |
-| Book table | `src/trader/persistence/models.py` `Book` | Add `process_profile` + `operating_note_path`. |
-| Open book CLI | `src/trader/cli.py` `books open` | Accept `--profile` and `--operating-note`. |
-
-Today a book already names its trader step `book_<slug>` so it can share a run
-with the live `daily_trader`. Multi-step books must prefix **every** catalogued
-step: `book_<slug>_<step>`. Live line uses catalogued names as-is.
-
-## Catalog: `config/pipelines.yaml`
-
-Human-owned, `extra="forbid"`, frozen Pydantic, same load style as
-`config/research.yaml`. Hash the file bytes onto daily and weekly runs the same
-way `agents.yaml` is already hashed (`cli.py` / `weekly_run`).
+Initial catalog:
 
 ```yaml
 version: 1
 default_profile: single_pass
-
 profiles:
   single_pass:
-    description: One manager decision on the raw research pack. Today's behavior.
+    description: One manager decision using collected research.
     steps:
       - role: daily_trader
         step: decide
         output: daily_decision
+        prompt: prompts/book_trader.md
         consumes: []
-
   research_then_adversary:
-    description: Compact, then dissent, then decide. Three invocations.
+    description: Research packet, adversarial packet, then manager decision.
     steps:
       - role: research_compactor
         step: packet
@@ -127,386 +62,273 @@ profiles:
       - role: daily_trader
         step: decide
         output: daily_decision
+        prompt: prompts/book_trader.md
         consumes: [packet, adversary]
 ```
 
-### Schema rules (fail closed at load)
+Load must fail on unknown fields, duplicate YAML keys, invalid or duplicate step names, unknown
+profiles, unsupported roles/output combinations, repeated consumes, forward references, unsupported
+context sources, and invalid prompt paths. Names use lowercase alphanumeric components separated
+by underscores. `MAX_PROFILE_STEPS = 5` is an exact module constant. There is exactly one
+`daily_decision` step, last, using `daily_trader`; packet steps use `research_compactor`.
 
-- Profile and step names: `^[a-z][a-z0-9_]*$`, unique within their scope.
-- `role` must be a registered `RoleName` in `agents.yaml`.
-- `output` is a closed literal: `research_packet` | `daily_decision` (add more
-  later; do not accept free strings).
-- Optional `prompt` is a project-relative file under `prompts/`, same
-  `is_relative_to(root)` check as role prompts. If omitted, use the role's
-  `prompt` from `agents.yaml`.
-- `consumes` names earlier steps only; no cycles; no forward references.
-- Exactly one `daily_decision` step, and it must be last.
-- A `research_packet` step must not use `daily_trader`.
-- A `daily_decision` step must use `daily_trader`.
-- Cap steps per profile (suggest 5) so a catalog edit cannot explode cost.
-- Unknown `default_profile` fails load.
+All effective skeleton paths, including role defaults, resolve to files under project `prompts/`.
+Reject absolute catalog prompt paths and symlink escapes. Recheck containment when reading prompts;
+a successful earlier catalog load does not authorize a subsequently changed file. Validate every
+required role is enabled before the first invocation. A catalog must not enable a role implicitly.
 
-Do **not** put this catalog inside `agents.yaml`. Roles are identity; profiles
-are composition.
+Keep `single_pass` as the default. Eight active three-step books plus the unchanged incumbent
+single invocation cost **25 model invocations per daily run**. If a future reviewed change also
+made the incumbent three-step, that would be 27. The five-step cap bounds custom profiles separately;
+25 is the supplied three-step configuration's cost, not a global invocation ceiling.
 
-New setting: `trader_pipelines_config: Path = Path("config/pipelines.yaml")`.
+## 2. Research packets and provenance
 
-`trader agents validate` must load and print the catalog (profile names, step
-counts, default).
+`src/trader/agent/packets.py` owns `ResearchPacket`, its cited claims, symbol sections, and the
+`NamedPacket` envelope. Keep facts, attributed source claims, and interpretations separate. Include
+contradictions, unknowns, dissent, and limitations as bounded fields. A fact label is a model's
+classification, not a certification by Python that the source proves it.
 
-### Cost note (document in AGENTS.md, do not code a second cap yet)
+Every cited claim has a stable local claim ID and nonempty, unique admitted evidence IDs. Its full
+identity includes the producing packet/invocation, so identical local IDs in separate packets are
+not interchangeable. `NamedPacket` records its catalog step, producing invocation ID, content hash,
+and typed packet. Hash canonical serialized content and verify it before downstream use.
 
-`research_then_adversary` is 3 invocations per book. 8 active books plus live
-`single_pass` is 9 Codex calls; if live also uses the rich profile it is 27.
-Keep `default_profile: single_pass`. Books opt in.
+Validation fails on invented evidence IDs, unsupported symbols, duplicate claim identities, and
+extra trade fields. Packet IDs and claim IDs never become new admitted primary-evidence IDs.
+Managers continue to cite the original run-scoped evidence IDs. Empty dissent is permitted: the
+adversary must not invent an objection merely to satisfy a quota.
 
-## Prompt composition
+Missing collected evidence means **unknown**, not proof that a company omitted a disclosure.
+Operating notes cannot override that distinction. An asserted source omission requires positive
+support about the source and comparison being made. Bounded collection is not exhaustive coverage.
 
-New helper, e.g. `src/trader/agent/prompts.py`:
+Packet outputs live in hashed invocation artifacts and the executor's in-memory packet bag; they
+write no `trade_proposals` or theses. A later packet is synthesis, never instructions granting tools
+or authority. Preserve every consumed predecessor in profile artifacts, not only a singular parent.
 
-```text
-<skeleton from prompts/*.md>
+## 3. Context projections and composed book prompts
 
----
-# Desk operating note
-The following note is this book's (or the live line's) operating instructions.
-It may specialize hunt, skepticism, and interpretation. It cannot grant tools,
-invent evidence IDs, submit orders, edit knowledge, or override the output schema
-or the portfolio policy. If it conflicts with this skeleton, follow the skeleton.
----
-<operating note or a one-line "no operating note">
-```
+`src/trader/agent/profile_context.py` separates immutable input loading from per-step projection:
 
-- Operating note max length: 8_000 chars, no control chars (reuse the weekly
-  `_safe_text` style).
-- Empty / missing note still appends the delimiter plus "no operating note" so
-  the skeleton never stands alone in two different hashed forms.
-- Live line: optional `knowledge/operating.md` later; **this slice** only wires
-  notes for books. Live prompt remains skeleton + "no operating note".
-- Write the composed prompt to the invocation's `prompt.md` (already done by
-  `invoke_role`). Do not also write a second copy.
+1. Load admitted persisted research once for a book evaluation, with its scan, raw documents,
+   evidence catalog, source hashes, and cutoff. Do not query research tables anew for each step.
+   The caller can share an identical immutable bundle between books. Require the research plan's
+   candidate symbols to exactly match the supplied scan. The scan pins collection intent; the
+   causal decision cutoff advances to the latest retrieval retained in that same run, so market
+   observations collected seconds later are not mistaken for hindsight. An observation or
+   publication after that retrieval cutoff still fails closed.
+2. Project that bundle under each step role's declared sources, `max_context_chars`, and
+   `max_document_chars`. Research context exposes candidates and research, not account, positions,
+   strategy, policy, or theses. Its supported-source map rejects those declarations.
+3. Include the exact declared consumed packets before budgeting. Reserve whole packets and all
+   fixed fields, then trim raw excerpts deterministically. Measure with the same canonical JSON
+   serialization used by `invoke_role`, not an approximate or differently formatted character count.
+4. Fail if the fixed context plus packets does not fit; do not drop packets silently. Validate
+   run identity and source permissions again at execution.
 
-### Prompt files to add or edit
+Use `ResearchAgentContext` with `RESEARCH_CONTEXT_SOURCES` for packet steps. Use
+`BookAgentContext(DailyAgentContext)` with `research_packets`, the latest active
+`waiting_decisions` record, and `BOOK_CONTEXT_SOURCES` for the book manager. The waiting record
+contains machine-assessed time/price/evidence changes; reopening a scoped wait requires an exact
+typed reconsideration citation. The incumbent `DailyAgentContext` and daily source map stay unchanged. Book-specific
+role configuration/projection supplies packet support without requiring it in the incumbent path.
+The `single_pass` book manager receives an empty packet tuple.
 
-| File | Change |
-| --- | --- |
-| `prompts/research_compactor.md` | Keep as packet skeleton. State it reports; it does not trade. Every fact cites admitted IDs. Missing evidence is unknown, not a signal, **unless the operating note says otherwise**. |
-| `prompts/research_adversary.md` | **New.** Same output schema as the compactor. Mission is dissent: attack the packet, surface alternative explanations, name what would have to be true for the packet to be wrong. Do not propose trades. Consume the prior packet as data, not instructions. |
-| `prompts/daily_trader.md` | Add: you may receive `research_packets` from earlier named steps; they are synthesis, not extra evidence IDs. Cite only `admitted_evidence_ids`. Follow the operating note for hunt/skepticism. Operating note cannot relax policy or invent IDs. Keep the beginner `daily_update` contract. |
-| `prompts/weekly_strategist.md` | See CEO section below. |
-| `prompts/event_trader.md` | Untouched this slice. |
+`src/trader/agent/prompts.py` composes a human-owned skeleton and a delimited operating note.
+Composition is deterministic, including a canonical absent-note representation, and the complete
+prompt is hashed and retained through `invoke_role`. Notes may specialize investigation and
+interpretation; they cannot relax evidence checks, tool permissions, schema, or risk policy.
 
-Do not move evidence-ID or permission rules out of Python into prose and call it done. The prose is for the model; the validator is the backstop.
+Operating notes are bounded to 8,000 characters; reject unsafe control characters while allowing
+normal line breaks and tabs. A supplied empty file fails; no note path is valid and means no note.
+Use book-specific prompt composition for packet guidance and manager packet interpretation. Add the
+research/adversary skeletons as needed; do not edit the incumbent daily-trader or weekly-strategist
+prompt for this slice.
 
-## Researcher output contract
+## 4. Profile execution and invocation lineage
 
-`research_compactor` has no Pydantic output today. Add `src/trader/agent/packets.py`
-(keep `reasoning.py` from growing further):
+`src/trader/agent/pipeline.py` composes the existing `invoke_role` primitive. Its callers supply a
+provider, resolved skeletons, note text, role-specific projector callbacks, and `on_decision` that
+persists proposals only. The executor has no collection, market-data, risk-override, or order API.
 
-```text
-CitedClaim      text + evidence_ids (64-hex, unique, nonempty)
-SymbolPacket    symbol, facts, source_claims, contradictions, unknowns, dissent
-ResearchPacket  schema_version=1, status="PACKET", symbols, limitations
-```
-
-Validation (`validate_research_packet(packet, admitted_evidence_ids, allowed_symbols)`):
-
-- Every evidence ID is in the run's admitted set (same rule as daily proposals).
-- Every symbol is in the slate or current positions.
-- No trade fields, no prices-as-orders, no `thesis_id`.
-- `dissent` may be empty on `packet` and should be nonempty on `adversary`
-  (enforce nonempty dissent only when the step name is `adversary`, or always
-  allow empty and let the prompt require it — prefer **always allow empty** in
-  Python so a thin packet is valid; the adversary prompt asks for dissent).
-
-`on_output` for packet steps: persist nothing to `trade_proposals`. The packet
-lives in invocation artifacts (`response.json`) and in the in-memory bag the
-executor hands to later steps. Optionally write `packet.json` next to the
-response for humans; do not add a new DB table this slice.
-
-## Context sources
-
-Add `ContextSource` value `research_packets`.
-
-| Assembler | Map |
-| --- | --- |
-| Daily | `"research_packets": ("research_packets",)` |
-| Compactor | keep `candidate_overview`, `deep_research`; add `research_packets` for the adversary step only |
-
-`DailyAgentContext` gains `research_packets: tuple[NamedPacket, ...] = ()` where
-`NamedPacket` is `{step: str, packet: ResearchPacket}`.
-
-`assemble_daily_context` stays the raw-research assembler. The pipeline executor
-**copies** that context and replaces/sets `research_packets` from consumed prior
-outputs before invoking a step that declares the source.
-
-Compactor needs its own context model if it should not see account/positions.
-Today it only declares candidate + research sources. Add
-`ResearchAgentContext` (run_id, as_of, candidates, evidence_catalog,
-deep_evidence, admitted_evidence_ids, research_packets) and
-`RESEARCH_CONTEXT_SOURCES`. Do not feed the compactor the portfolio or strategy
-unless the catalogued role lists those sources — and the catalogued
-`research_compactor` role should **not** list them. Strategy/personality for
-researchers comes from the operating note on the composed prompt, not from
-dumping `strategy.md` into a packet role.
-
-`verify_context_sources` must pass for whatever role+context pair the executor
-builds. If a profile step's role declares a source the executor cannot fill,
-fail at profile execution (or at `agents validate` if it can be known statically).
-
-Static check at catalog load: for each step, every `context_sources` entry on
-that role is in the executor's supported map for that output type. Compactor
-cannot declare `account_snapshot`. Daily trader that lists `research_packets`
-is fine even on `single_pass` (field is empty). **Add `research_packets` to
-`daily_trader` in `config/agents.yaml`.** Add it to `research_compactor` too so
-the adversary step is legal; `packet` (first step) receives an empty tuple.
-
-## Pipeline executor
-
-New module `src/trader/agent/pipeline.py`. Knows nothing about `Broker`.
+The result is definitive:
 
 ```text
-run_profile(
-    session, config, catalog, profile_name,
-    *, run_id, run_directory, provider,
-    step_prefix: str = "",           # "" live; "book_<slug>_" for books
-    skeleton_prompts: ...,           # resolved per step
-    operating_note: str,
-    assemble_research_context,       # callable -> ResearchAgentContext
-    assemble_daily_context,          # callable -> DailyAgentContext
-    on_decision: persist proposals,  # only called for daily_decision
-) -> ProfileRunResult
+ProfileRunResult
+  terminal: RoleInvocationResult[DailyDecision]
+  trail: tuple[str, ...]  # successful invocation IDs in catalog order
 ```
 
-For each step in order:
+Retain the complete terminal result, including context, prompt, and evidence-manifest hashes.
+Do not replace it with a thin decision/invocation pair. Packet-step hashes remain associated with
+their own invocations. Book summaries use `terminal.invocation_id`.
 
-1. Resolve output model from `output`.
-2. Assemble the right context; inject consumed packets.
-3. `compose_prompt(skeleton, operating_note)`.
-4. `WorkflowStep(role=..., step=step_prefix + catalog_step, parent_invocation_id=...)`.
-5. `invoke_role` with the step's validate; `on_output` only if `daily_decision`.
-6. Stash output by catalog step name (not the prefixed name) so `consumes`
-   stays profile-local.
+For every step, resolve declared consumed packets, project context, compose the prompt, and invoke
+the declared output model with validation. Only a successful terminal decision calls `on_decision`.
+Namespace every book step as `book_<uuidhex>_<slug_with_underscores>_<step>`, converting slug
+hyphens to underscores. The immutable book UUID prevents ambiguous slug/step concatenations
+(`foo-bar` + `baz` versus `foo` + `bar_baz`). Do not use double-underscore separators: `WorkflowStep`
+forbids them. Profile-local `consumes` names remain unprefixed; the incumbent invocation stays unnamed. Refuse existing artifact directories and duplicate
+workflow identities rather than overwriting or retrying them.
 
-`ProfileRunResult` carries the terminal `DailyDecision`, the decide
-`invocation_id` (what `DailyReasoningResult` and `BookRunSummary` already
-expose), and the trail of step invocation IDs.
+`parent_invocation_id` is the **last declared consumed predecessor**, or `None` for a root. It is
+not the complete dependency graph. Profile plan/result/failure artifacts preserve ordered steps,
+invocation IDs, and **all** consumed predecessor invocation IDs and packet hashes. Together with
+`workflow_trail` and invocation artifacts these reconstruct both a linear trail and merge inputs.
+A failure retains the completed prefix and profile failure JSON without persisting a terminal
+proposal. Recorded model failures mark the book evaluation `FAILED`; retaining an invocation failure
+without resolving its evaluation is insufficient.
 
-Refactor:
+## 5. Simulated-book integration
 
-- `ShadowDailyReasoningPipeline.run` assembles daily context once, then
-  `run_profile(default_profile, step_prefix="")`. Still returns
-  `DailyReasoningResult` from the decide step. Artifact path for live decide
-  becomes `agent/daily_trader/decide` instead of `agent/daily_trader`. Update
-  tests that hardcode the unnamed path.
-- `BookEvaluationPipeline._invoke` calls `run_profile(book.process_profile,
-  step_prefix="book_<slug>_")` with that book's strategy document already in
-  the daily context and that book's operating note. Keep try/except isolation.
-- Do not persist book proposals until the decide step succeeds. If `packet`
-  fails, the book fails isolated; live is unaffected. If live `packet` fails,
-  the live run fails closed (today any daily_trader failure fails the run).
+`BookEvaluationPipeline` invokes the selected profile against the book's own strategy, account,
+positions, prior decisions, and operating note. Collection, risk authorization, fill simulation,
+and performance recording remain in their existing owners. Do not route the incumbent daily path
+through `run_profile` in this slice. A book failure remains isolated from other books and the
+incumbent run, while its own evaluation fails closed.
 
-Parent invocation: set parent to the invocation id of the **last** name in
-`consumes`, or `None`. Good enough for a linear profile. Document that a merge
-step's parent is the last consumed predecessor, not a multi-parent (the column
-is singular).
+Held-position valuation accepts only symbol-matched, timezone-aware, finite, positive, uncrossed
+quotes within the recorded simulator age limit. A broker-reported market-clock cutoff is carried
+through context, risk, settlement, and performance. Performance and drawdown queries exclude
+snapshots after the evaluation cutoff, including when a historical run is backfilled.
 
-## Books
+`books open` gains `--profile NAME` and `--operating-note PATH`; list/show expose the selection.
+An unknown profile fails. Existing rows migrate to `single_pass` with no note. Book names remain
+globally unique across active, paused, and retired rows, and `MAX_ACTIVE_BOOKS = 8` remains binding.
+Starting cash is finite, positive, and no greater than the loaded risk configuration's
+`portfolio.expected_max_equity_usd`; never duplicate the numeric ceiling in code.
 
-Alembic revision after current head (`c9a3d7e21f48` or whatever `alembic heads`
-says at implementation time):
+Both strategy and operating-note files must resolve to readable files inside the project root,
+including symlink resolution. Enforce this when opening and again when reading/synchronizing for
+evaluation. An old stored path outside the root fails that book's evaluation in isolation; do not
+rewrite legacy paths or grandfather escapes. This introduces explicit containment for book
+strategies; it is not a claim that the old strategy loader already enforced it.
 
-- `books.process_profile` `String NOT NULL` server default `single_pass`
-- `books.operating_note_path` `Text NULL`
+Human edits remain possible. Re-read documents each evaluation and retain the effective content
+hashes; a subsequent configuration change starts a new experimental phase.
 
-SQLite cannot FK to YAML. `open_book` validates the name against the loaded
-catalog. Changing a retired/paused book's profile is out of scope; add
-`trader books open --profile NAME --operating-note PATH`. Show them on
-`books list` / `books show`.
+## 6. Experiment phases and evaluation manifests
 
-Operating note path: same containment rule as strategy documents (project file,
-readable). Hash contents when composing the prompt; also store the path on the
-book so a human can edit the file. Like strategy documents, `sync_strategy_document`
-already re-reads the file each run — do the same for the operating note (read
-at evaluation time, do not snapshot in the DB beyond the path). A note edit
-mid-experiment is a human act; `prompt_hash` on later invocations will differ,
-which is the audit trail.
+Persist book configuration fields plus `BookExperimentPhase` and `BookEvaluation` records through
+an Alembic migration. `src/trader/books/experiments.py` owns durable evaluation claims and phase
+identity, independent of models and brokers.
 
-## CEO (weekly strategist)
+A phase records the effective configuration: catalog/profile and agent configuration versions,
+strategy, skeleton/composed prompts, operating note, resolved model/provider settings, risk policy,
+and simulator assumptions. A null model selection must be explicitly identified as an **unpinned**
+experiment: recording a provider default does not freeze the actual model. Retain canonical
+manifests and their hashes, not just mutable paths.
+Every profile invocation also records its book/evaluation scope, configured model profile and
+reasoning effort, timestamps, and provider-reported input/cached/output/reasoning token breakdown.
+Provider-reported monetary cost and pricing may be retained, but absent CLI pricing stays NULL and
+must not be replaced by an unrelated API-price estimate.
+An evaluation records its book/run/phase identity, cutoff, input manifest and evidence hashes,
+status, terminal invocation, and failure details. Link the retained profile artifacts for ordered
+lineage and all consumed predecessors. Research input changes belong to evaluations; they do not
+by themselves start new configuration phases.
 
-### Context additions
+Reuse only the latest matching configuration phase. A sequence A → B → A has three phases, not one
+resurrected A phase. Refuse duplicate book/run evaluation claims, invalid terminal invocations,
+manifest mismatches, repeated resolution, and backdated insertion that would distort phase order.
+Retain failures so unsuccessful configurations do not disappear from the experimental record.
 
-- `pipeline_catalog`: names, descriptions, step lists (no prompt file bodies).
-- `active_books`: name, status, process_profile, strategy_content_hash,
-  starting_cash, latest equity and proposal/fill counts if cheap to load from
-  existing `load_book_state` / performance snapshots. Bound the list
-  (`MAX_ACTIVE_BOOKS` is 8). Empty is fine.
-- New context sources: `pipeline_catalog`, `active_books`. Add them to
-  `weekly_strategist` in `config/agents.yaml` and to `WEEKLY_CONTEXT_SOURCES`.
+Only one evaluation may remain `STARTED` for a book; enforce this with a database partial unique
+index as well as service validation. Recovery is an explicit operator action:
+`trader books recover-evaluation ID --reviewer NAME --note TEXT`. It requires a `FAILED` parent run
+and no `STARTED` invocation belonging to that book, records the operator decision, preserves all
+artifacts and settlement, and never retries the same book/run claim.
 
-Do **not** dump every book's strategy document into the weekly context this
-slice (size). Names + hashes + profile + a short equity snapshot are enough
-to propose a new book rather than a live-document edit.
+This makes process differences inspectable. The same strategy and evidence do **not** establish
+causal improvement: stochastic model outputs, model versions, portfolio history, execution timing,
+and simulation assumptions can differ. This slice supplies provenance for later controlled forward
+experiments, not a performance claim or a claim of novelty over prior multi-agent trading work.
 
-### Output contract
+## Acceptance and verification
 
-Extend `StrategyRecommendation.status` to
-`NO_CHANGE | PROPOSE_CHANGE | PROPOSE_BOOK`.
+No real daily run or broker submission was used to verify this slice. Local tests use temporary
+databases, migrations, stubbed model providers, simulated market data, and fake paper brokers.
 
-`ProposedBook` (new):
+- Catalog tests reject unsupported roles/outputs, cycles/forward consumes, duplicate keys/names,
+  unknown defaults, path escapes, and profiles longer than five steps.
+- Packet tests reject invented citations, extra trade fields, duplicate identities, hash mismatch,
+  and invalid consumed lineage. Facts, source claims, and interpretations remain distinguishable.
+- Projection tests show research loads once, role-specific disclosure and limits apply, consumed
+  packets are reserved intact, canonical serialized size fits, scan/plan symbols match, causal
+  retrieval cutoffs apply, and oversized fixed contexts fail.
+- Stubbed provider tests cover one-step and three-step profiles, full terminal hashes, every merge
+  predecessor, namespaced artifacts, disabled roles, and isolated packet/decision failure.
+- Book tests cover default migration, CLI options, both document containment checks including legacy
+  escapes, human-owned cash limits, quote validity/freshness, historical snapshot cutoffs, exact
+  terminal-step ownership, duplicate evaluation, phase changes, and retained failures.
+- Regression tests preserve incumbent context/prompt/invocation behavior, `book_id IS NULL` readers,
+  long-only paper restrictions, and model/execution separation.
+- Validate fresh and upgraded temporary databases. Run `uv run pytest`, `uv run ruff check .`, and
+  `uv run mypy src`; record actual outcomes in the implementation handoff, not invented counts here.
 
-| Field | Rule |
-| --- | --- |
-| `name` | Same slug rules as `normalize_book_name` |
-| `process_profile` | Must exist in the supplied catalog |
-| `strategy_source` | `fork_live` only this slice (copy live strategy as the starting document) |
-| `operating_note` | 1–8000 safe chars |
-| `starting_cash_usd` | Positive decimal string, `<= expected_max_equity_usd` (2500). Parse as Decimal. |
-| `hypothesis`, `evaluation_plan`, `revert_criteria` | Same spirit as `ProposedStrategyChange` |
+## Future CEO specification — not implemented by steps 1–6
 
-Coherence:
+The existing weekly strategist continues to propose an anchored incumbent strategy edit or no
+change. Do not add `PROPOSE_BOOK`, weekly context sources, or CEO prompt changes in this slice.
+The following decisions resolve the previous plan's ambiguity for a future implementation.
 
-- `NO_CHANGE`: no proposed_changes, no proposed_book.
-- `PROPOSE_CHANGE`: exactly one `proposed_changes`, no `proposed_book`. Existing
-  empty-period rule still applies.
-- `PROPOSE_BOOK`: exactly one `proposed_book`, no `proposed_changes`. Allow this
-  even when the live line had no decisions — a new book can be justified by
-  "the incumbent did nothing" — but still require `cited_run_ids` to be in
-  context **or** allow empty citations with a written hypothesis. Prefer:
-  citations must be from context if any are given; a book proposal with zero
-  citations is allowed only when `performance.has_sample()` is false. Keep it
-  strict and simple: **require at least one cited run if the period has
-  decisions; otherwise allow none.**
+### Inputs, policy, and reserved work
 
-Validate `process_profile` against context catalog, `name` not already in
-`active_books`, cash ceiling against a constant imported from risk config or a
-literal 2500 matching `expected_max_equity_usd`. Do not let the CEO pick
-`event_trader` or a made-up role.
+Supply catalog descriptions and all books' names/status/profile/configuration identity/cash, not
+only active names. Bound the historical summaries deterministically without losing the complete
+reserved-name set. Show active-book statistics through `period_end`: equity, simulated fills,
+proposal counts, and configuration phases. Historical status and hashes must also come from state
+known by the cutoff, not today's mutable book row.
 
-### Persistence
+Keep historical evaluation inputs distinct from current operational constraints: current reserved
+names, available roster slots, and outstanding proposals are admission facts, not period evidence.
+Pass `max_book_starting_cash_usd` from the loaded risk ceiling into weekly context and validate it;
+missing or invalid policy fails closed. Do not hardcode a cash amount.
 
-`record_strategy_review` grows a `BOOK_SPAWN_PROPOSED` `knowledge_changes` row
-(`entity_type="book_spawn"`, payload JSON of `ProposedBook`). Idempotency still
-one review outcome per weekly run.
+Recheck the normalized slug in the database across every book status at proposal validation and
+approval. Reserve names from pending and approved-but-unopened spawn proposals as well. Permit at
+most one outstanding spawn across those two states. Approval does not release the reservation.
+A future implementation must provide an explicit audited link from manual instantiation to its
+approved proposal, or an explicit human cancellation releasing it; until then leave it outstanding.
+Do not infer fulfillment merely from an unrelated matching name, or silently expire reservations.
 
-**Do not open the book.** Human copies the operating note to
-`knowledge/books/<name>.operating.md`, copies strategy to
-`knowledge/books/<name>.md`, then:
+### Output and persistence
 
-```bash
-uv run trader books open <name> --cash 2000 \
-  --strategy knowledge/books/<name>.md \
-  --profile research_then_adversary \
-  --operating-note knowledge/books/<name>.operating.md
-```
+One weekly outcome: `NO_CHANGE`, `PROPOSE_CHANGE`, or `PROPOSE_BOOK`. The latter carries exactly one
+`ProposedBook`: normalized name, catalog profile, `strategy_source=fork_live`, bounded operating
+note, positive Decimal-string cash, hypothesis, evaluation plan, and revert criteria. It contains
+no strategy edit. Validate all cited IDs against supplied context; require at least one cited run
+when the period has decisions, and permit none for an empty period. An empty period still cannot
+support an anchored strategy edit under the existing rule.
 
-Optional this slice, only if cheap: `trader strategy proposals` also lists
-pending book spawns; `trader books open --from-proposal ID` writes the files
-and opens. If that starts to sprawl, skip it and print the JSON on
-`weekly-run` / `strategy show` so a human can copy.
+Use a distinct typed `BookSpawnProposal` reader, `get_book_spawn_proposal`; reconstruct the payload
+with `ProposedBook.model_validate_json(record.after_text)` and fail on malformed data. Do not reuse
+`StrategyProposal` or strategy-specific entity constants.
 
-Rejecting a book spawn: `BOOK_SPAWN_REJECTED` via `trader strategy reject`
-already covering the new entity type, or leave reject as strategy-only and
-let unused `BOOK_SPAWN_PROPOSED` rows sit. Prefer extending reject/show to
-both entity types so the CEO path is closable.
+| KnowledgeChange column | Proposal | Approval / rejection |
+| --- | --- | --- |
+| `entity_type` | `book_spawn` | `book_spawn_change` |
+| `entity_id` | normalized proposed slug | proposal row ID |
+| `change_type` | `BOOK_SPAWN_PROPOSED` | `BOOK_SPAWN_APPROVED` / `BOOK_SPAWN_REJECTED` |
+| `before_text` | empty string | empty string |
+| `after_text` | `ProposedBook.model_dump_json()` | same JSON on approval; empty on rejection |
+| `reason` | diagnosis, hypothesis, evaluation plan, revert criteria | reviewer and note |
+| `evidence_ids_json` | cited run/proposal/thesis IDs | `[]` |
 
-Approving a book spawn does **not** write files automatically unless
-`--from-proposal` is implemented. Default: approve is recorded
-(`BOOK_SPAWN_APPROVED`) and still requires the explicit `books open`. That
-matches "CEO proposes, human instantiates."
+One review outcome per weekly run is the idempotency boundary across all three statuses. Resolution
+is append-only and single-use. Fulfillment/cancellation needs its own explicit audited lifecycle;
+it must not rewrite an approval into a rejection.
 
-### `prompts/weekly_strategist.md` rewrite (substance)
+### Complete future human inbox
 
-Tell the CEO:
+`trader strategy proposals|show|approve|reject` dispatches generically by proposal change type.
+Strategy show displays an anchored diff; strategy approval applies the edit and requires the
+resulting content hash, as today. Book show displays typed proposal JSON; book approval records
+approval only, prints operating-note text and an exact `books open` command, and writes no files
+or book rows. Its resolver does **not** require `applied_content_hash`. Rejection records the matching
+strategy or book resolution without writing files. Unknown types fail closed.
 
-- You run a desk of teams (books) plus one live paper book.
-- You may propose **one** thing: an anchored edit to the live strategy, **or**
-  a new simulated book with a **catalogued** process profile and an operating
-  note, **or** no change.
-- You do not write system prompts, invent pipeline steps, pick models, touch
-  risk/policy, or open/retire books.
-- Operating notes specialize hunt and interpretation (including unorthodox
-  readings of absence). They cannot grant tools or relax evidence IDs.
-- Prefer a new book when the idea is a different hypothesis or process; prefer
-  a live edit when the incumbent rule is wrong for the live mandate.
-- Use catalog descriptions to choose `single_pass` vs `research_then_adversary`.
-  Default to `single_pass` unless the hypothesis needs a dissent pass.
-- Judge process vs outcome luck, as today. Book snapshots in context are
-  incomplete this slice; do not overclaim from them.
-
-## Tests (write these; they define done)
-
-New `tests/unit/test_pipelines.py`:
-
-- Catalog loads; unknown role / forward consume / two decide steps / missing
-  default / prompt path escape all fail.
-- `compose_prompt` includes skeleton and note; empty note is canonical.
-- Executor with `RecordingProvider`: `single_pass` one invoke, step `decide`,
-  no parent; `research_then_adversary` three invokes, parents set, daily
-  trader context contains both packets.
-- Packet with invented evidence ID fails the book/live invoke (FAILED row,
-  no proposals).
-- Compactor output cannot persist a trade proposal (no `on_output` for that
-  step; a malicious extra field is rejected by `extra="forbid"`).
-
-Update `tests/unit/test_agent_reasoning.py` / invocation tests for
-`research_packets` on the daily context and the live artifact path
-`agent/daily_trader/decide`.
-
-Update `tests/unit/test_books.py`:
-
-- Open with `--profile` unknown fails; default is `single_pass`.
-- Book with `research_then_adversary` prefixes steps
-  `book_<slug>_packet` etc. and still isolates failure.
-- Live `book_id IS NULL` readers unchanged.
-
-Update `tests/unit/test_weekly_strategist.py`:
-
-- `PROPOSE_BOOK` with unknown profile fails.
-- Duplicate book name fails.
-- `PROPOSE_BOOK` plus `proposed_changes` fails.
-- `NO_CHANGE` / `PROPOSE_CHANGE` still work.
-- Catalog and active_books missing from context fail source verification when
-  the role declares them.
-
-Keep `uv run pytest`, `uv run ruff check .`, `uv run mypy src` green.
-
-## Docs to update (same PR)
-
-- `AGENTS.md`: process profile catalog; CEO may propose books + operating notes
-  + profile name, not prompts; live/book evaluation runs the profile; compactor
-  is invoked when a profile says so; artifact paths include named decide steps.
-- `docs/remaining_work.md`: mark "spawn a book from a weekly proposal" as
-  **proposed, human-applied** if `--from-proposal` is skipped; leave auto-spawn
-  unchecked.
-- Do not rewrite `docs/research_pipeline_design.md` except a one-line pointer
-  that packets are now a profile step, not yet a follow-up research loop.
-
-## Implementation order
-
-1. Pydantic catalog + `config/pipelines.yaml` + settings path + validate CLI.
-2. `ResearchPacket` + `validate_research_packet` + unit tests (no provider).
-3. `compose_prompt` + adversary prompt file + daily/compactor prompt edits.
-4. Context source + `ResearchAgentContext` + `research_packets` on daily context.
-5. `run_profile` executor + refactor live daily pipeline. Fix tests for
-   `decide` step names.
-6. Book columns, migration, CLI flags, book evaluator uses profile + note.
-7. Weekly context, `PROPOSE_BOOK`, knowledge_changes, strategist prompt, tests.
-8. AGENTS.md / remaining_work.md.
-
-Stop after 6 if weekly scope slips; a catalog that the daily/book paths already
-run is useful without the CEO. Do not ship CEO prompt changes before the
-catalog exists — the model would propose profiles that cannot execute.
-
-## Acceptance
-
-- `uv run trader agents validate` reports roles **and** profiles.
-- A daily test run with `default_profile: single_pass` still produces one
-  `daily_trader/decide` invocation and the same proposal/risk/ledger behavior.
-- Opening `mean-reversion` with `--profile research_then_adversary` and an
-  operating note causes three invocations on the next daily run for that book,
-  isolated from live, no broker.
-- `weekly-run` can emit `PROPOSE_BOOK`; nothing in that run creates a `books`
-  row.
-- No new imports of `Broker` from `agent/` or `books/`.
-- No edits to `config/risk.yaml` or `knowledge/portfolio_policy.md`.
+`books open --from-proposal` and automatic file creation are outside this specification. Human
+instantiation remains explicit, with the audited association described above required before an
+approved proposal stops occupying the outstanding slot. CEO sequence memory, comparative scoring,
+and automatic trial lifecycle changes need their own subsequent designs.

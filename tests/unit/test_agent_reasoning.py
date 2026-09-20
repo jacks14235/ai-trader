@@ -6,6 +6,7 @@ from subprocess import CompletedProcess
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
 from trader.agent.codex_cli import (
     CodexCLIInvocationError,
@@ -14,20 +15,34 @@ from trader.agent.codex_cli import (
 )
 from trader.agent.config import AgentConfig, ModelProfile, load_agent_config
 from trader.agent.models import TradeProposal
+from trader.agent.profile_context import BookAgentContext
 from trader.agent.reasoning import (
+    AbstentionRecord,
     DailyAgentContext,
     DailyDecision,
     DailyUpdate,
+    WaitReconsideration,
+    WaitTrigger,
     assemble_daily_context,
     validate_daily_decision,
     verify_daily_context_sources,
 )
 from trader.agent.runtime import ShadowDailyReasoningPipeline
 from trader.broker.models import Account, Position
-from trader.ledger.models import RecentRunDecision
+from trader.ledger.models import (
+    RecentRunDecision,
+    WaitingDecisionMemory,
+    WaitTriggerAssessment,
+)
 from trader.ledger.service import record_run_report
 from trader.persistence.db import create_session_factory
-from trader.persistence.models import AgentInvocation, Run, Thesis, TradeProposalRecord
+from trader.persistence.models import (
+    AgentDecisionRecord,
+    AgentInvocation,
+    Run,
+    Thesis,
+    TradeProposalRecord,
+)
 from trader.persistence.repositories import persist_research_item, persist_trade_proposal
 from trader.research.artifacts import ResearchArtifact
 from trader.research.collection import ResearchCollection
@@ -114,6 +129,174 @@ def test_context_is_bounded_and_decision_must_use_admitted_evidence(tmp_path: Pa
     )
     with pytest.raises(ValueError, match="outside the invocation manifest"):
         validate_daily_decision(invented, context)
+
+
+def test_active_wait_requires_a_machine_observed_change_before_reopening(tmp_path: Path) -> None:
+    session, run, scan, research, research_id = _research_state(tmp_path)
+    config = load_agent_config(PROJECT_ROOT / "config" / "agents.yaml")
+    base = assemble_daily_context(
+        session,
+        run_id=run.id,
+        as_of=scan.as_of,
+        strategy="Strategy",
+        portfolio_policy="Policy",
+        account=Account(equity="2000", cash="2000", buying_power="2000"),
+        positions=(),
+        open_orders=(),
+        scan=scan,
+        research=research,
+        role=config.roles["daily_trader"],
+    )
+    decision = DailyDecision(
+        status="PROPOSE_TRADES",
+        market_assessment="The setup is now actionable.",
+        strongest_counterargument="The move may reverse.",
+        daily_update=_briefing(),
+        proposals=(
+            TradeProposal(
+                proposal_id=uuid4(),
+                symbol="SPY",
+                action="BUY",
+                target_notional_usd="100",
+                confidence=0.6,
+                time_horizon="days",
+                rationale="The admitted record supports a bounded entry.",
+                invalidation_conditions=["Price loses support"],
+                evidence_ids=[research_id],
+                max_acceptable_price="650",
+            ),
+        ),
+    )
+    waiting = WaitingDecisionMemory(
+        decision_id="prior-wait",
+        invocation_id="prior-invocation",
+        run_id="prior-run",
+        scheduled_for=base.as_of - timedelta(days=1),
+        classification="DELIBERATE_WAIT",
+        insufficient_evidence="The entry price was unattractive.",
+        scope_symbols=("SPY",),
+        review_due=False,
+        trigger_assessments=(
+            WaitTriggerAssessment(
+                trigger_id="better_price",
+                kind="PRICE",
+                description="Wait for a better SPY price.",
+                status="UNSATISFIED",
+                reason="The midpoint remains above the threshold.",
+                symbol="SPY",
+                current_price="610",
+                comparison="AT_OR_BELOW",
+                target_price="600",
+            ),
+        ),
+        reopenable=False,
+    )
+    context = BookAgentContext.model_validate(
+        {**base.model_dump(), "waiting_decisions": [waiting.model_dump()]}
+    )
+    with pytest.raises(ValueError, match="without a changed condition"):
+        validate_daily_decision(decision, context)
+
+    changed = waiting.model_copy(
+        update={
+            "reopenable": True,
+            "trigger_assessments": (
+                waiting.trigger_assessments[0].model_copy(update={"status": "SATISFIED"}),
+            ),
+        }
+    )
+    context = context.model_copy(update={"waiting_decisions": (changed,)})
+    reopened = decision.model_copy(
+        update={
+            "wait_reconsiderations": (
+                WaitReconsideration(
+                    prior_decision_id="prior-wait",
+                    trigger_ids=("better_price",),
+                    rationale="The machine-assessed SPY midpoint now meets the entry threshold.",
+                ),
+            )
+        }
+    )
+    assert validate_daily_decision(reopened, context) is reopened
+    invented = reopened.model_copy(
+        update={
+            "wait_reconsiderations": (
+                reopened.wait_reconsiderations[0].model_copy(
+                    update={"trigger_ids": ("invented",)}
+                ),
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="not satisfied"):
+        validate_daily_decision(invented, context)
+
+
+def test_no_action_requires_testable_abstention_and_future_review(tmp_path: Path) -> None:
+    session, run, scan, research, _research_id = _research_state(tmp_path)
+    config = load_agent_config(PROJECT_ROOT / "config" / "agents.yaml")
+    context = assemble_daily_context(
+        session,
+        run_id=run.id,
+        as_of=scan.as_of,
+        strategy="Strategy",
+        portfolio_policy="Policy",
+        account=Account(equity="2000", cash="2000", buying_power="2000"),
+        positions=(),
+        open_orders=(),
+        scan=scan,
+        research=research,
+        role=config.roles["daily_trader"],
+    )
+    with pytest.raises(ValueError, match="structured abstention"):
+        DailyDecision(
+            status="NO_ACTION",
+            market_assessment="No clear setup.",
+            strongest_counterargument="Waiting can miss a move.",
+            daily_update=_briefing(),
+        )
+
+    past = DailyDecision(
+        status="NO_ACTION",
+        market_assessment="No clear setup.",
+        strongest_counterargument="Waiting can miss a move.",
+        abstention=_abstention(reconsider_at=context.as_of),
+        daily_update=_briefing(),
+    )
+    with pytest.raises(ValueError, match="later than the context cutoff"):
+        validate_daily_decision(past, context)
+
+    foreign_symbol = past.model_copy(
+        update={
+            "abstention": _abstention(
+                reconsider_at=context.as_of + timedelta(days=1),
+                trigger=WaitTrigger(
+                    trigger_id="foreign_price",
+                    kind="PRICE",
+                    description="Wait for a price outside the admitted slate.",
+                    symbol="MSFT",
+                    comparison="AT_OR_BELOW",
+                    target_price="300",
+                ),
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="symbol was not admitted"):
+        validate_daily_decision(foreign_symbol, context)
+
+    with pytest.raises(ValueError, match="requires unavailable_data"):
+        AbstentionRecord(
+            classification="DATA_UNAVAILABLE",
+            insufficient_evidence="A required filing was unavailable.",
+            triggers=(
+                WaitTrigger(
+                    trigger_id="filing_arrives",
+                    kind="EVIDENCE",
+                    description="Review after the filing can be collected.",
+                    evidence_needed="The current primary filing.",
+                ),
+            ),
+            reconsider_on="Publication of the current filing.",
+        )
 
 
 def test_declaring_a_context_source_the_assembler_cannot_supply_fails_closed() -> None:
@@ -272,7 +455,21 @@ def test_shadow_pipeline_persists_invocation_and_never_executes(tmp_path: Path) 
         status="NO_ACTION",
         market_assessment="No sufficiently asymmetric setup.",
         strongest_counterargument="A short-term move remains possible.",
-        no_action_reason="Evidence is insufficient.",
+        abstention=AbstentionRecord(
+            classification="DELIBERATE_WAIT",
+            insufficient_evidence="Evidence is insufficient.",
+            triggers=(
+                WaitTrigger(
+                    trigger_id="spy_price_entry",
+                    kind="PRICE",
+                    description="Reconsider if SPY falls to the planned entry price.",
+                    symbol="SPY",
+                    comparison="AT_OR_BELOW",
+                    target_price="625",
+                ),
+            ),
+            reconsider_on="The next daily review after new market evidence is collected.",
+        ),
         daily_update=_briefing(),
     ).model_dump_json()
     provider = FakeReasoningProvider(response)
@@ -309,6 +506,11 @@ def test_shadow_pipeline_persists_invocation_and_never_executes(tmp_path: Path) 
     assert invocation.response_path == "agent/daily_trader/response.json"
     assert research_id in provider.received_prompt
     assert session.query(TradeProposalRecord).count() == 0
+    decision = session.scalar(select(AgentDecisionRecord))
+    assert decision is not None
+    assert decision.agent_invocation_id == invocation.id
+    assert decision.status == "NO_ACTION"
+    assert decision.abstention_classification == "DELIBERATE_WAIT"
     assert (run_directory / "agent" / "daily_trader" / "response.json").is_file()
 
 
@@ -405,6 +607,27 @@ def _briefing(**overrides: object) -> DailyUpdate:
     }
     payload.update(overrides)
     return DailyUpdate.model_validate(payload)
+
+
+def _abstention(
+    *,
+    reconsider_at: datetime,
+    trigger: WaitTrigger | None = None,
+) -> AbstentionRecord:
+    return AbstentionRecord(
+        classification="DELIBERATE_WAIT",
+        insufficient_evidence="The available evidence does not establish a decisive signal.",
+        triggers=(
+            trigger
+            or WaitTrigger(
+                trigger_id="stronger_evidence",
+                kind="EVIDENCE",
+                description="Reconsider when independent evidence confirms the setup.",
+                evidence_needed="Independent evidence that confirms the proposed causal thesis.",
+            ),
+        ),
+        reconsider_at=reconsider_at,
+    )
 
 
 def _research_state(

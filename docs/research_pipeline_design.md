@@ -1,7 +1,9 @@
 # Research Pipeline Design
 
-Status: Alpaca + SEC single-pass collection and daily-trader reasoning are implemented. Evidence
-synthesis, model-requested follow-up research, and web/paid enrichment remain.
+Status: Alpaca + SEC single-pass collection and daily-trader reasoning are implemented. The current
+[process-profile slice](process_profiles_plan.md) adds locally verified cited synthesis for simulated
+books only. Model-requested follow-up research and web/paid enrichment remain future work. The
+incumbent daily context and prompt remain unchanged.
 
 ## Objective
 
@@ -84,7 +86,8 @@ and admitted providers.
 3. Implemented: provider-neutral bounded collection and immutable raw artifact writing.
 4. Implemented: Alpaca market/news and official SEC ticker/submissions/company-facts providers.
 5. Implemented: `trader research plan` read-only preview.
-6. Implemented: collection inside `daily-run` in shadow mode, still producing `NO_ACTION`.
+6. Implemented: shadow collection inside `daily-run`; collection itself has no execution interface.
+   Separately gated daily reasoning can produce proposals for deterministic risk and paper execution.
 7. Implemented: stubbed provider, duplicate, timestamp, budget, migration, and recursive-manifest tests.
 
 ## Depth without unbounded tools
@@ -94,12 +97,27 @@ model a live network tool. Three additions get most of the available depth.
 
 ### 1. Evidence packets (research compactor)
 
-Today `assemble_daily_context` truncates raw `normalized_text` to fit a character budget, so the
-daily trader competes for context with boilerplate. A compactor pass should turn retained documents
-into per-symbol packets that keep facts, attributed source claims, contradictions, and freshness
-while dropping repetition. Packets are themselves hashed artifacts with their own IDs, and every
-statement must carry the exact upstream `research_id`s so a packet never becomes a laundering step
-for uncited claims. Truncation then removes redundancy rather than evidence.
+The book-only profile slice adds `ResearchPacket` steps in `agent/packets.py` and projections in
+`agent/profile_context.py`. Raw admitted evidence is loaded once for a book evaluation, then each
+step receives a projection under its own role limits. Consumed packets are reserved before trimming
+raw excerpts, using the invocation boundary's canonical serialized character count. Packet roles
+receive research, not portfolio accounts, strategy, or execution interfaces. `BookAgentContext`
+extends the unchanged incumbent daily context with consumed packets.
+
+Packets distinguish facts, attributed source claims, interpretations, contradictions, and unknowns.
+They retain producing invocation IDs, content hashes, and local claim IDs; downstream context and
+profile artifacts retain every consumed predecessor. Citations must name admitted original research
+IDs. Packet/claim IDs are provenance, not newly admitted source evidence. A valid citation proves
+membership in the evidence set, not that the source entails a model's interpretation.
+
+A missing collected item is an unknown. It does not prove that a company omitted a disclosure,
+and an operating note cannot turn it into that proof. Broader collection-coverage metadata and
+supported source comparisons are future prerequisites for systematic omission research.
+
+This is a bounded synthesis workflow over existing evidence, not additional collection or a
+learning claim. Terminal managers now record an evidence-cited disposition for every consumed
+contradiction/dissent claim and a typed waiting record for no-action. Predictions, memory updates,
+and measured process comparisons remain later slices.
 
 ### 2. Model-requested follow-up research
 
@@ -115,8 +133,8 @@ bounded second round:
 4. Round two collects only the surviving requests. Its documents receive run-scoped evidence IDs
    exactly like round one.
 
-The model chooses *what to ask*; configuration still decides what may be fetched and how much. Round
-count is capped (two is enough to start) so the loop always terminates. Budgets must be accounted
+The model chooses *what to ask*; configuration still decides what may be fetched and how much. The first
+implementation must set an exact maximum of two collection rounds so the loop always terminates. Budgets must be accounted
 cumulatively across rounds, which the current single-pass validators do not do.
 
 ### 3. New providers behind the same contract
@@ -134,3 +152,10 @@ More context is not better research. Before expanding sources, record enough per
 whether research changed decisions: packet count and size, how many admitted evidence IDs were
 actually cited, how often follow-up requests were issued and granted, and whether cited evidence
 was primary or secondary. Without that, provider expansion is unfalsifiable.
+
+
+Book phase/evaluation manifests retain effective configuration and evidence provenance. These
+support comparisons but do not establish causality: even equal strategy/evidence hashes can coexist
+with different model outputs, portfolio histories, execution conditions, or unpinned model defaults.
+Later evaluation should record inference costs, preserve failed variants, predefine comparisons,
+and use forward trials. Historical date filtering cannot remove knowledge embedded in model weights.

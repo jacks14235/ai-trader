@@ -1,0 +1,10 @@
+[Unit]
+Description=Run AI Trader weekly strategy review after the trading week
+
+[Timer]
+OnCalendar=Sat *-*-* 00:15:00
+AccuracySec=1min
+Unit=ai-trader-weekly.service
+
+[Install]
+WantedBy=timers.target

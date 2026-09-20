@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     trader_dynamic_runs_config: Path = Path("config/dynamic_runs.yaml")
     trader_research_config: Path = Path("config/research.yaml")
     trader_agents_config: Path = Path("config/agents.yaml")
+    trader_pipelines_config: Path = Path("config/pipelines.yaml")
     trader_strategy_document: Path = Path("knowledge/strategy.md")
     trader_portfolio_policy: Path = Path("knowledge/portfolio_policy.md")
     trader_reasoning_enabled: bool = False

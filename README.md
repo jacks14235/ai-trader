@@ -111,14 +111,59 @@ order even when `TRADING_ENABLED=true`.
 The app invokes `codex exec` non-interactively using stdin and a JSON output schema. The session is
 ephemeral, user/project Codex configuration is ignored, web and shell tools are disabled, approvals
 are disabled, and the sandbox is read-only. The exact prompt, resolved role settings, strategy,
-context, evidence IDs, schema, provider logs, response, hashes, and reported token usage are retained
-under the run directory and in `agent_invocations`. Every cited evidence ID must belong to that run.
+context, evidence IDs, schema, provider logs, response, and hashes are retained under the run
+directory. `agent_invocations` records the configured model/profile/effort, start and completion
+times, explicit book/evaluation scope, input, cached-input, output, reasoning-output and total token
+counts, plus any provider-reported monetary cost. Codex CLI currently reports the token breakdown
+but no price or billed cost, so those fields explicitly remain unavailable instead of applying API
+prices to CLI subscription usage. `trader runs show RUN_ID` exposes each entry and `trader books show
+NAME` aggregates usage by model. Every cited evidence ID must belong to that run.
 Unsupported symbols or invented evidence fail the run closed. The application builds a complete,
 time-pinned risk context using Alpaca's market clock, fresh IEX quotes, rolling daily dollar volume,
 broker-authoritative asset metadata, portfolio snapshots, and today's persisted order activity. It
 persists every approval or rejection with the effective policy hash before the executor can submit an
 order. The reasoning role always retains `can_submit_orders: false`; only deterministic software owns
 the paper broker submission method.
+
+## Simulated research-team books
+
+Simulated books can choose a bounded process from `config/pipelines.yaml`. `single_pass` uses one
+manager decision. `research_then_adversary` first produces a cited research packet, then a cited
+adversarial review, and finally gives both packets to the book manager. The research roles cannot
+see portfolio state or submit proposals; only the final manager can propose trades, and those still
+pass through deterministic risk checks before the local simulator fills them. `NO_ACTION` is the
+explicit default when the evidence does not justify changing the portfolio. It is stored as a
+structured abstention with the evidence gap, observable price/evidence/event triggers, and a future
+review time or named event. Every contradiction or dissent claim in a consumed packet must receive
+an evidence-cited manager disposition: accepted, rejected, or deferred to a concrete trigger.
+Book decisions link to their exact evaluation; failed evaluations retain the attempted reasoning for
+audit but are excluded from completed-decision comparisons.
+The latest completed book abstention is also carried forward as active waiting memory. Python marks
+time and price triggers, compares source content hashes to distinguish genuinely new evidence, and
+requires a trade that reopens the wait to cite the exact changed condition. Unresolved named events
+cannot authorize a reopen.
+
+The initial controlled pair is documented in `docs/initial_book_trial.md`. Both books use the same
+strategy bytes and starting cash; only their process profile differs. Open a separate strategy
+variant under a new name rather than repurposing either control book.
+
+Book strategy and operating-note paths must remain inside the project. Each evaluation retains its
+exact profile, prompts, note, strategy, model settings, evidence hashes, risk configuration, and
+simulator assumptions in an immutable experiment phase. Only one evaluation can own a book at a
+time. Research plans must match their candidate scan, and the evaluation rejects stale or malformed
+valuation quotes and future performance data. If a process is interrupted, the guarded recovery
+command is available only after the parent run is already `FAILED` and every started invocation for
+that book has been resolved:
+
+```bash
+uv run trader books recover-evaluation EVALUATION_ID --reviewer NAME --note "why it is stale"
+```
+
+Every completed book evaluation also records two model-free reference points beginning with the
+book's starting cash: flat cash with no interest, and one fractional SPY purchase held without
+rebalancing. The SPY reference pays the configured spread, slippage, and commission assumptions and
+is marked at the quote midpoint. Reference failures are recorded separately and do not become agent
+decisions or consume model calls.
 
 Before enabling automatic paper submissions, exercise the same risk and execution boundary with the
 canary. The default is a no-submit dry run. A submitting canary requires both the explicit flag and

@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -16,9 +17,14 @@ from trader.agent.models import TradeProposal
 from trader.broker.models import Account, Position
 from trader.risk.models import RiskDecision
 
+if TYPE_CHECKING:
+    from trader.agent.reasoning import DailyDecision
+
 from .models import (
+    AgentDecisionRecord,
     AgentInvocation,
     AgentInvocationEvidence,
+    BookEvaluation,
     BrokerOrderEvent,
     BrokerOrderRecord,
     DailyReport,
@@ -62,6 +68,7 @@ class RunAuditTrail:
     research_item_questions: list[ResearchItemQuestion]
     agent_invocations: list[AgentInvocation]
     agent_invocation_evidence: list[AgentInvocationEvidence]
+    agent_decisions: list[AgentDecisionRecord]
     trade_proposals: list[TradeProposalRecord]
     risk_decisions: list[RiskDecisionRecord]
     broker_orders: list[BrokerOrderRecord]
@@ -527,6 +534,144 @@ def associate_agent_invocation_evidence(
     return links
 
 
+def persist_agent_decision(
+    session: Session,
+    run_id: str,
+    invocation_id: str,
+    decision: "DailyDecision",
+    *,
+    book_id: str | None = None,
+    book_evaluation_id: str | None = None,
+    commit: bool = True,
+) -> AgentDecisionRecord:
+    """Persist one validated terminal decision for the live line or a simulated book."""
+    invocation = session.get(AgentInvocation, invocation_id)
+    if invocation is None:
+        raise LookupError(f"agent invocation not found: {invocation_id}")
+    if invocation.run_id != run_id or invocation.role != "daily_trader":
+        raise ValueError("terminal decision invocation must be this run's daily_trader")
+    if book_id is None:
+        if book_evaluation_id is not None or invocation.step:
+            raise ValueError("live terminal decision must use the unnamed daily invocation")
+    else:
+        expected_prefix = f"book_{book_id.replace('-', '')}_"
+        if not invocation.step.startswith(expected_prefix):
+            raise ValueError("book terminal decision does not match its invocation namespace")
+        if book_evaluation_id is None:
+            raise ValueError("book terminal decision requires its evaluation ID")
+        evaluation = session.get(BookEvaluation, book_evaluation_id)
+        if (
+            evaluation is None
+            or evaluation.run_id != run_id
+            or evaluation.book_id != book_id
+        ):
+            raise ValueError("book terminal decision does not match its evaluation")
+
+    raw_json = decision.model_dump_json()
+    abstention_json = (
+        None if decision.abstention is None else decision.abstention.model_dump_json()
+    )
+    dissent_json = json.dumps(
+        [item.model_dump(mode="json") for item in decision.dissent_dispositions],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    existing = session.scalar(
+        select(AgentDecisionRecord).where(
+            AgentDecisionRecord.agent_invocation_id == invocation_id
+        )
+    )
+    if existing is not None:
+        _verify_same(
+            existing.run_id == run_id
+            and existing.book_id == book_id
+            and existing.book_evaluation_id == book_evaluation_id
+            and existing.schema_version == decision.schema_version
+            and existing.status == decision.status
+            and _optional_json_equal(existing.abstention_json, abstention_json)
+            and _json_equal(existing.dissent_dispositions_json, dissent_json)
+            and _json_equal(existing.raw_json, raw_json),
+            "agent decision",
+            invocation_id,
+        )
+        return existing
+
+    record = AgentDecisionRecord(
+        run_id=run_id,
+        agent_invocation_id=invocation_id,
+        book_id=book_id,
+        book_evaluation_id=book_evaluation_id,
+        schema_version=decision.schema_version,
+        status=decision.status,
+        abstention_classification=(
+            None if decision.abstention is None else decision.abstention.classification
+        ),
+        abstention_json=abstention_json,
+        dissent_dispositions_json=dissent_json,
+        raw_json=raw_json,
+    )
+    session.add(record)
+    if not commit:
+        session.flush()
+        return record
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        line = (
+            AgentDecisionRecord.book_id.is_(None)
+            if book_id is None
+            else AgentDecisionRecord.book_id == book_id
+        )
+        concurrent = session.scalar(
+            select(AgentDecisionRecord).where(AgentDecisionRecord.run_id == run_id, line)
+        )
+        if concurrent is None:
+            raise
+        _verify_same(
+            concurrent.agent_invocation_id == invocation_id
+            and concurrent.book_evaluation_id == book_evaluation_id
+            and concurrent.schema_version == decision.schema_version
+            and concurrent.status == decision.status
+            and _optional_json_equal(concurrent.abstention_json, abstention_json)
+            and _json_equal(concurrent.dissent_dispositions_json, dissent_json)
+            and _json_equal(concurrent.raw_json, raw_json),
+            "agent decision",
+            invocation_id,
+        )
+        return concurrent
+    return record
+
+
+def load_completed_agent_decisions(
+    session: Session,
+    *,
+    run_ids: Sequence[str],
+    book_id: str | None = None,
+) -> tuple[AgentDecisionRecord, ...]:
+    """Return decisions whose enclosing live run or exact book evaluation completed."""
+    if not run_ids:
+        return ()
+    statement = select(AgentDecisionRecord).where(AgentDecisionRecord.run_id.in_(run_ids))
+    if book_id is None:
+        statement = statement.join(Run, Run.id == AgentDecisionRecord.run_id).where(
+            AgentDecisionRecord.book_id.is_(None),
+            Run.status == "COMPLETED",
+        )
+    else:
+        statement = statement.join(
+            BookEvaluation,
+            BookEvaluation.id == AgentDecisionRecord.book_evaluation_id,
+        ).where(
+            AgentDecisionRecord.book_id == book_id,
+            BookEvaluation.book_id == book_id,
+            BookEvaluation.status == "COMPLETED",
+            BookEvaluation.terminal_invocation_id
+            == AgentDecisionRecord.agent_invocation_id,
+        )
+    return tuple(session.scalars(statement.order_by(AgentDecisionRecord.created_at)))
+
+
 def persist_trade_proposal(
     session: Session,
     run_id: str,
@@ -534,11 +679,13 @@ def persist_trade_proposal(
     *,
     agent_invocation_id: str | None = None,
     book_id: str | None = None,
+    commit: bool = True,
 ) -> TradeProposalRecord:
     """Persist a proposal once; identical retries return the original row.
 
     ``book_id`` records which decision line the proposal belongs to: ``None`` is the live
-    portfolio, a value is a simulated book.
+    portfolio, a value is a simulated book. ``commit=False`` lets an invocation own the
+    transaction so a rejected batch cannot leave a partially persisted decision.
     """
     proposal_id = str(proposal.proposal_id)
     raw_json = proposal.model_dump_json()
@@ -569,6 +716,9 @@ def persist_trade_proposal(
         raw_json=raw_json,
     )
     session.add(record)
+    if not commit:
+        session.flush()
+        return record
     try:
         session.commit()
     except IntegrityError:
@@ -827,6 +977,7 @@ def get_run_audit_trail(session: Session, run_id: str) -> RunAuditTrail:
             session,
             agent_invocation_ids,
         ),
+        agent_decisions=_list_by_run(session, AgentDecisionRecord, run_id),
         trade_proposals=_list_by_run(session, TradeProposalRecord, run_id),
         risk_decisions=_list_by_run(session, RiskDecisionRecord, run_id),
         broker_orders=orders,

@@ -16,7 +16,7 @@ from trader.agent.reasoning import (
     validate_daily_decision,
 )
 from trader.broker.models import Account, BrokerOrder, Position
-from trader.persistence.repositories import persist_trade_proposal
+from trader.persistence.repositories import persist_agent_decision, persist_trade_proposal
 from trader.research.service import ResearchRunResult
 from trader.settings import Settings
 from trader.universe.models import UniverseScan
@@ -38,6 +38,12 @@ class DailyReasoningResult:
             "invocation_id": self.invocation_id,
             "status": self.decision.status,
             "proposal_count": len(self.decision.proposals),
+            "abstention_classification": (
+                None
+                if self.decision.abstention is None
+                else self.decision.abstention.classification
+            ),
+            "dissent_disposition_count": len(self.decision.dissent_dispositions),
             "context_hash": self.context_hash,
             "prompt_hash": self.prompt_hash,
             "evidence_manifest_hash": self.evidence_manifest_hash,
@@ -109,12 +115,20 @@ class ShadowDailyReasoningPipeline:
         )
 
         def persist_proposals(decision: DailyDecision, invocation_id: str) -> None:
+            persist_agent_decision(
+                self.session,
+                run_id,
+                invocation_id,
+                decision,
+                commit=False,
+            )
             for proposal in decision.proposals:
                 persist_trade_proposal(
                     self.session,
                     run_id,
                     proposal,
                     agent_invocation_id=invocation_id,
+                    commit=False,
                 )
 
         result = invoke_role(

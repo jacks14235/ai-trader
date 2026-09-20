@@ -10,7 +10,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from trader.ledger.models import (
@@ -27,6 +27,7 @@ from trader.ledger.service import (
 )
 from trader.ledger.strategy import strategy_versions_in_effect
 from trader.persistence.models import (
+    AgentDecisionRecord,
     BrokerOrderRecord,
     Fill,
     KnowledgeChange,
@@ -176,11 +177,21 @@ def load_weekly_performance(
     )
     filled_order_ids = _orders_with_fills(session, [order.id for order in orders])
 
-    proposals_by_run: dict[str, int] = defaultdict(int)
-    for proposal in proposals:
-        proposals_by_run[proposal.run_id] += 1
-    no_action_runs = sum(
-        1 for run in runs if run.status == "COMPLETED" and not proposals_by_run[run.id]
+    no_action_runs = (
+        session.scalar(
+            select(func.count())
+            .select_from(AgentDecisionRecord)
+            .join(Run, Run.id == AgentDecisionRecord.run_id)
+            .where(
+                AgentDecisionRecord.run_id.in_(run_ids),
+                AgentDecisionRecord.book_id.is_(None),
+                AgentDecisionRecord.status == "NO_ACTION",
+                Run.status == "COMPLETED",
+            )
+        )
+        or 0
+        if run_ids
+        else 0
     )
 
     changes = (

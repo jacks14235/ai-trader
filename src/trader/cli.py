@@ -1,6 +1,7 @@
 """Operational CLI. Paper mode only; live trading intentionally unavailable."""
 
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -11,6 +12,7 @@ import typer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from trader.agent.catalog import load_pipeline_catalog
 from trader.agent.config import load_agent_config
 from trader.agent.event_runner import event_run
 from trader.agent.invocation import workflow_trail
@@ -18,6 +20,7 @@ from trader.agent.runner import daily_run
 from trader.agent.runtime import configured_daily_reasoning_pipeline
 from trader.agent.weekly import apply_anchored_change
 from trader.agent.weekly_runner import configured_weekly_review
+from trader.books.experiments import mark_interrupted_book_evaluation
 from trader.books.runtime import book_ledger, configured_book_evaluation_pipeline
 from trader.books.service import (
     get_book,
@@ -37,7 +40,14 @@ from trader.ledger.knowledge import (
 from trader.ledger.strategy import strategy_content_hash
 from trader.logging.audit import audit
 from trader.persistence.db import create_session_factory
-from trader.persistence.models import MarketEvent, Run
+from trader.persistence.models import (
+    AgentDecisionRecord,
+    AgentInvocation,
+    Book,
+    BookEvaluation,
+    MarketEvent,
+    Run,
+)
 from trader.persistence.repositories import latest_snapshot, snapshot
 from trader.research.config import load_research_config
 from trader.research.events import BeaEventProvider, EventProvider, FileEventProvider
@@ -360,6 +370,8 @@ def list_books_command(
                 "realized_pnl": str(state.realized_pnl),
                 "fill_count": state.fill_count,
                 "strategy_document_path": book.strategy_document_path,
+                "process_profile": book.process_profile,
+                "operating_note_path": book.operating_note_path,
             }
         )
     typer.echo(json.dumps(rows, indent=2))
@@ -374,19 +386,38 @@ def open_book_command(
         typer.Option("--strategy", help="Path to the variant's strategy document."),
     ],
     description: Annotated[str | None, typer.Option("--description")] = None,
+    profile: Annotated[
+        str | None, typer.Option("--profile", help="Catalogued process for this simulated book.")
+    ] = None,
+    operating_note: Annotated[
+        Path | None, typer.Option("--operating-note", help="Project-contained desk instructions.")
+    ] = None,
 ) -> None:
     """Open a simulated book. It never reaches the broker."""
     try:
         starting_cash = Decimal(cash)
     except ArithmeticError as exc:
         raise typer.BadParameter("cash must be a decimal number") from exc
-    _settings, session = database_service()
+    settings, session = database_service()
+    root = settings.trader_agents_config.resolve().parent.parent
+    catalog = load_pipeline_catalog(
+        settings.trader_pipelines_config,
+        load_agent_config(settings.trader_agents_config),
+        project_root=root,
+    )
     book = open_book(
         session,
         name=name,
         starting_cash=starting_cash,
         strategy_document_path=strategy,
         description=description,
+        process_profile=profile or catalog.default_profile,
+        operating_note_path=operating_note,
+        catalog=catalog,
+        project_root=root,
+        max_starting_cash=load_risk_config(
+            settings.trader_risk_config
+        ).portfolio.expected_max_equity_usd,
     )
     typer.echo(
         json.dumps(
@@ -397,6 +428,8 @@ def open_book_command(
                 "starting_cash": book.starting_cash,
                 "strategy_document_path": book.strategy_document_path,
                 "strategy_content_hash": book.strategy_content_hash,
+                "process_profile": book.process_profile,
+                "operating_note_path": book.operating_note_path,
             },
             indent=2,
         )
@@ -423,6 +456,40 @@ def show_book_command(name: str) -> None:
                     }
                     for position in state.positions
                 ],
+            },
+            indent=2,
+        )
+    )
+
+
+@books_app.command("recover-evaluation")
+def recover_book_evaluation_command(
+    evaluation_id: str,
+    reviewer: Annotated[
+        str,
+        typer.Option("--reviewer", help="Operator who verified the interrupted evaluation."),
+    ],
+    note: Annotated[
+        str,
+        typer.Option("--note", help="Evidence that the process stopped and the claim is stale."),
+    ],
+) -> None:
+    """Release a stale book claim after its failed parent run is safely resolved."""
+    _settings, session = database_service()
+    evaluation = mark_interrupted_book_evaluation(
+        session,
+        evaluation_id=evaluation_id,
+        reviewer=reviewer,
+        note=note,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "evaluation_id": evaluation.id,
+                "book_id": evaluation.book_id,
+                "run_id": evaluation.run_id,
+                "status": evaluation.status,
+                "error": json.loads(evaluation.error or "{}"),
             },
             indent=2,
         )
@@ -458,6 +525,11 @@ def validate_agents() -> None:
     """Validate every registered role, prompt, context source, and permission boundary."""
     settings = get_settings()
     config = load_agent_config(settings.trader_agents_config)
+    catalog = load_pipeline_catalog(
+        settings.trader_pipelines_config,
+        config,
+        project_root=settings.trader_agents_config.resolve().parent.parent,
+    )
     if not settings.trader_strategy_document.is_file():
         raise ValueError(f"strategy document not found: {settings.trader_strategy_document}")
     if not settings.trader_portfolio_policy.is_file():
@@ -466,6 +538,13 @@ def validate_agents() -> None:
         json.dumps(
             {
                 "valid": True,
+                "simulated_book_profiles": {
+                    "default": catalog.default_profile,
+                    "profiles": {
+                        name: {"step_count": len(profile.steps), "description": profile.description}
+                        for name, profile in catalog.profiles.items()
+                    },
+                },
                 "mode": config.mode,
                 "environment_reasoning_enabled": settings.trader_reasoning_enabled,
                 "automatic_daily_run": config.automatic_daily_run,
@@ -478,14 +557,105 @@ def validate_agents() -> None:
                         "enabled": role.enabled,
                         "profile": role.profile,
                         "model": config.model_profiles[role.profile].model,
-                        "reasoning_effort": (
-                            config.model_profiles[role.profile].reasoning_effort
-                        ),
+                        "reasoning_effort": (config.model_profiles[role.profile].reasoning_effort),
                         "context_sources": role.context_sources,
                         "can_submit_orders": role.permissions.can_submit_orders,
                     }
                     for name, role in config.roles.items()
                 },
+            },
+            indent=2,
+        )
+    )
+
+
+@agents_app.command("usage")
+def agent_usage(
+    book: Annotated[str | None, typer.Option("--book")] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+) -> None:
+    """Aggregate recorded model usage across runs, models, and simulated books."""
+    _settings, session = database_service()
+    statement = select(AgentInvocation).order_by(AgentInvocation.started_at, AgentInvocation.id)
+    selected_book: Book | None = None
+    if book is not None:
+        selected_book = get_book(session, book)
+        statement = statement.where(AgentInvocation.book_id == selected_book.id)
+    if model is not None:
+        statement = statement.where(AgentInvocation.model == model)
+    records = session.scalars(statement).all()
+    book_names = {
+        item.id: item.name
+        for item in session.scalars(
+            select(Book).where(
+                Book.id.in_({item.book_id for item in records if item.book_id is not None})
+            )
+        )
+    }
+
+    def totals(items: Sequence[AgentInvocation]) -> dict[str, object]:
+        costs = [Decimal(item.cost_usd) for item in items if item.cost_usd is not None]
+        return {
+            "invocation_count": len(items),
+            "completed_count": sum(item.status == "COMPLETED" for item in items),
+            "failed_count": sum(item.status == "FAILED" for item in items),
+            "usage_reported_count": sum(
+                item.input_token_count is not None and item.output_token_count is not None
+                for item in items
+            ),
+            "cached_input_reported_count": sum(
+                item.cached_input_token_count is not None for item in items
+            ),
+            "reasoning_output_reported_count": sum(
+                item.reasoning_output_token_count is not None for item in items
+            ),
+            "input_tokens": sum(item.input_token_count or 0 for item in items),
+            "cached_input_tokens": sum(item.cached_input_token_count or 0 for item in items),
+            "output_tokens": sum(item.output_token_count or 0 for item in items),
+            "reasoning_output_tokens": sum(
+                item.reasoning_output_token_count or 0 for item in items
+            ),
+            "total_tokens": sum(
+                item.total_token_count
+                if item.total_token_count is not None
+                else (item.input_token_count or 0) + (item.output_token_count or 0)
+                for item in items
+            ),
+            "cost_reported_count": len(costs),
+            "reported_cost_usd": str(sum(costs, Decimal("0"))) if costs else None,
+        }
+
+    by_model = {
+        name: totals([item for item in records if item.model == name])
+        for name in sorted({item.model for item in records})
+    }
+    scopes = {
+        item.book_id if item.book_id is not None else "live" for item in records
+    }
+    by_book = {
+        ("live" if scope == "live" else book_names.get(scope, scope)): totals(
+            [
+                item
+                for item in records
+                if (item.book_id if item.book_id is not None else "live") == scope
+            ]
+        )
+        for scope in sorted(scopes)
+    }
+    typer.echo(
+        json.dumps(
+            {
+                "filters": {
+                    "book": None if selected_book is None else selected_book.name,
+                    "model": model,
+                },
+                "totals": totals(records),
+                "by_model": by_model,
+                "by_book": by_book,
+                "cost_note": (
+                    "Codex CLI token usage is recorded; monetary cost remains unavailable unless "
+                    "the provider reports it."
+                ),
             },
             indent=2,
         )
@@ -588,6 +758,32 @@ def show_run(run_id: str) -> None:
     run = session.get(Run, run_id)
     if not run:
         raise typer.Exit(1)
+    decisions = {
+        record.agent_invocation_id: record
+        for record in session.scalars(
+            select(AgentDecisionRecord).where(AgentDecisionRecord.run_id == run_id)
+        )
+    }
+    evaluation_ids = {
+        record.book_evaluation_id
+        for record in decisions.values()
+        if record.book_evaluation_id is not None
+    }
+    evaluations = {
+        record.id: record
+        for record in session.scalars(
+            select(BookEvaluation).where(BookEvaluation.id.in_(evaluation_ids))
+        )
+    }
+    decision_scopes: dict[str, dict[str, str | None]] = {}
+    for invocation_id, decision in decisions.items():
+        evaluation_id = decision.book_evaluation_id
+        evaluation = None if evaluation_id is None else evaluations.get(evaluation_id)
+        decision_scopes[invocation_id] = {
+            "book_id": decision.book_id,
+            "book_evaluation_id": evaluation_id,
+            "evaluation_status": run.status if evaluation is None else evaluation.status,
+        }
     typer.echo(
         json.dumps(
             {
@@ -603,9 +799,43 @@ def show_run(run_id: str) -> None:
                         "attempt": invocation.attempt,
                         "parent_invocation_id": invocation.parent_invocation_id,
                         "status": invocation.status,
+                        "book_id": invocation.book_id,
+                        "book_evaluation_id": invocation.book_evaluation_id,
+                        "provider": invocation.provider,
+                        "model": invocation.model,
+                        "model_profile": invocation.model_profile,
+                        "reasoning_effort": invocation.reasoning_effort,
+                        "started_at": invocation.started_at.isoformat(),
+                        "completed_at": (
+                            None
+                            if invocation.completed_at is None
+                            else invocation.completed_at.isoformat()
+                        ),
+                        "usage": (
+                            None
+                            if invocation.usage_json is None
+                            else json.loads(invocation.usage_json)
+                        ),
+                        "cost_usd": invocation.cost_usd,
+                        "cost_source": invocation.cost_source,
+                        "pricing": (
+                            None
+                            if invocation.pricing_json is None
+                            else json.loads(invocation.pricing_json)
+                        ),
                         "request_path": invocation.request_path,
                         "response_path": invocation.response_path,
                         "error": invocation.error_summary,
+                        "decision": (
+                            json.loads(decisions[invocation.id].raw_json)
+                            if invocation.id in decisions
+                            else None
+                        ),
+                        "decision_scope": (
+                            decision_scopes[invocation.id]
+                            if invocation.id in decisions
+                            else None
+                        ),
                     }
                     for invocation in workflow_trail(session, run.id)
                 ],

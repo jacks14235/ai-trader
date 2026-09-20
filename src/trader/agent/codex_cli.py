@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -18,15 +19,44 @@ class InvocationResponse:
     stderr: str
     input_token_count: int | None = None
     output_token_count: int | None = None
+    cached_input_token_count: int | None = None
+    reasoning_output_token_count: int | None = None
+    cost_usd: Decimal | None = None
+    cost_source: str = "NOT_REPORTED"
+
+    @property
+    def total_token_count(self) -> int | None:
+        if self.input_token_count is None or self.output_token_count is None:
+            return None
+        return self.input_token_count + self.output_token_count
+
+    def usage_payload(self) -> dict[str, object]:
+        return {
+            "input_tokens": self.input_token_count,
+            "cached_input_tokens": self.cached_input_token_count,
+            "output_tokens": self.output_token_count,
+            "reasoning_output_tokens": self.reasoning_output_token_count,
+            "total_tokens": self.total_token_count,
+            "cost_usd": None if self.cost_usd is None else str(self.cost_usd),
+            "cost_source": self.cost_source,
+        }
 
 
 class CodexCLIInvocationError(RuntimeError):
     """A failed CLI process with its machine-readable diagnostics retained."""
 
-    def __init__(self, message: str, *, stdout: str, stderr: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str,
+        stderr: str,
+        usage: InvocationResponse | None = None,
+    ) -> None:
         super().__init__(message)
         self.stdout = stdout
         self.stderr = stderr
+        self.usage = usage
 
 
 class StructuredReasoningProvider(Protocol):
@@ -121,6 +151,7 @@ class CodexCLIProvider:
                     f"Codex CLI exited with status {completed.returncode}: {detail}",
                     stdout=completed.stdout[-100_000:],
                     stderr=completed.stderr[-100_000:],
+                    usage=_response_usage(completed.stdout),
                 )
             try:
                 response_text = response_path.read_text(encoding="utf-8")
@@ -130,13 +161,17 @@ class CodexCLIProvider:
                 raise RuntimeError("Codex CLI returned an empty final response")
             if len(response_text) > max_output_chars:
                 raise RuntimeError("Codex CLI response exceeded the configured output limit")
-            input_tokens, output_tokens = _token_usage(completed.stdout)
+            usage = _response_usage(completed.stdout)
             return InvocationResponse(
                 response_text=response_text,
                 stdout=completed.stdout[-20_000:],
                 stderr=completed.stderr[-20_000:],
-                input_token_count=input_tokens,
-                output_token_count=output_tokens,
+                input_token_count=usage.input_token_count,
+                output_token_count=usage.output_token_count,
+                cached_input_token_count=usage.cached_input_token_count,
+                reasoning_output_token_count=usage.reasoning_output_token_count,
+                cost_usd=usage.cost_usd,
+                cost_source=usage.cost_source,
             )
 
 
@@ -197,20 +232,52 @@ def _failure_detail(stdout: str, stderr: str) -> str:
     return "no diagnostic output"
 
 
-def _token_usage(stdout: str) -> tuple[int | None, int | None]:
-    """Extract the final reported token counts without depending on one event envelope."""
-    result: tuple[int | None, int | None] = (None, None)
+def _response_usage(stdout: str) -> InvocationResponse:
+    """Extract the final provider usage object without assuming one event envelope."""
+    result = InvocationResponse("", "", "")
     for line in stdout.splitlines():
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
         for candidate in _objects(value):
-            input_tokens = candidate.get("input_tokens")
-            output_tokens = candidate.get("output_tokens")
-            if type(input_tokens) is int and type(output_tokens) is int:
-                result = (input_tokens, output_tokens)
+            input_tokens = _token(candidate.get("input_tokens"))
+            output_tokens = _token(candidate.get("output_tokens"))
+            if input_tokens is None or output_tokens is None:
+                continue
+            cached = _token(candidate.get("cached_input_tokens"))
+            reasoning = _token(candidate.get("reasoning_output_tokens"))
+            if cached is not None and cached > input_tokens:
+                continue
+            if reasoning is not None and reasoning > output_tokens:
+                continue
+            cost = _cost(candidate.get("cost_usd"))
+            result = InvocationResponse(
+                "",
+                "",
+                "",
+                input_token_count=input_tokens,
+                output_token_count=output_tokens,
+                cached_input_token_count=cached,
+                reasoning_output_token_count=reasoning,
+                cost_usd=cost,
+                cost_source="CLI_REPORTED" if cost is not None else "NOT_REPORTED",
+            )
     return result
+
+
+def _token(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _cost(value: object) -> Decimal | None:
+    if not isinstance(value, (str, int, float, Decimal)) or isinstance(value, bool):
+        return None
+    try:
+        cost = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    return cost if cost.is_finite() and cost >= 0 else None
 
 
 def _objects(value: object) -> Iterator[dict[str, object]]:

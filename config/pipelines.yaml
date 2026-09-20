@@ -1,0 +1,31 @@
+# Simulated books opt into a process; this catalog does not alter daily brokerage reasoning.
+version: 1
+default_profile: single_pass
+
+profiles:
+  single_pass:
+    description: One manager decision on the admitted research pack.
+    steps:
+      - role: daily_trader
+        step: decide
+        output: daily_decision
+        prompt: prompts/book_trader.md
+        consumes: []
+
+  research_then_adversary:
+    description: Compact evidence, examine competing explanations, then decide. Three invocations.
+    steps:
+      - role: research_compactor
+        step: packet
+        output: research_packet
+        consumes: []
+      - role: research_compactor
+        step: adversary
+        output: research_packet
+        prompt: prompts/research_adversary.md
+        consumes: [packet]
+      - role: daily_trader
+        step: decide
+        output: daily_decision
+        prompt: prompts/book_trader.md
+        consumes: [packet, adversary]

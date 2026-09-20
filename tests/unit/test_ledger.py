@@ -265,6 +265,18 @@ def test_performance_snapshot_is_idempotent_and_detects_divergent_equity(tmp_pat
         )
 
 
+def test_backfilled_performance_snapshot_does_not_use_future_curve_points(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    future = _snapshot(session, day=22, equity="3000", cash="3000")
+    past = _snapshot(session, day=21, equity="2000", cash="2000")
+
+    assert future.equity == "3000"
+    assert past.pnl is None
+    assert past.return_pct is None
+    assert snapshot_peak_equity(past) == Decimal("2000")
+    assert past.drawdown_pct == "0"
+
+
 def test_daily_report_rows_are_idempotent_and_detect_divergent_content(tmp_path: Path) -> None:
     session = _session(tmp_path)
     run = _run(session, key="daily:2026-08-22", scheduled_for=AS_OF)

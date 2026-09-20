@@ -1,0 +1,10 @@
+[Unit]
+Description=Run AI Trader daily paper pipeline on trading weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:15:00
+AccuracySec=1min
+Unit=ai-trader-daily.service
+
+[Install]
+WantedBy=timers.target

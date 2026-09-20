@@ -6,12 +6,13 @@ automatic_daily_run: true
 model_profiles:
   fast:
     provider: codex_cli
-    # Null inherits the locally installed Codex default. Pin a model slug here after evals.
-    model: null
+    # Keep packet-generation costs bounded and pin identity for comparable book phases.
+    model: gpt-5.6-terra
     reasoning_effort: medium
   deep:
     provider: codex_cli
-    model: null
+    # Use the same decision model for every preliminary book manager.
+    model: gpt-5.6-sol
     reasoning_effort: high
 
 roles:
@@ -19,7 +20,7 @@ roles:
     enabled: true
     profile: fast
     prompt: prompts/research_compactor.md
-    context_sources: [candidate_overview, deep_research]
+    context_sources: [candidate_overview, deep_research, research_packets]
     max_context_chars: 160000
     max_document_chars: 5000
     max_output_chars: 30000

@@ -1,0 +1,10 @@
+[Unit]
+Description=AI Trader weekly paper strategy review
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jack/ai-trader
+Environment="PATH=/home/jack/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/jack/.local/bin/uv run --locked trader weekly-run

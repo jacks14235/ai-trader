@@ -41,6 +41,8 @@ from trader.ledger.strategy import (
 )
 from trader.persistence.db import create_session_factory
 from trader.persistence.models import (
+    AgentDecisionRecord,
+    AgentInvocation,
     BrokerOrderRecord,
     KnowledgeChange,
     Run,
@@ -203,6 +205,32 @@ def test_weekly_performance_aggregates_only_the_requested_period(tmp_path: Path)
         as_of=inside.scheduled_for,
     )
     quiet = _run(session, key="daily:2026-08-19", scheduled_for=start + timedelta(days=4))
+    quiet_invocation = AgentInvocation(
+        run_id=quiet.id,
+        role="daily_trader",
+        purpose="daily_trader_paper_proposal",
+        model="test",
+        provider="test",
+        prompt_version="v2",
+        request_path="agent/daily_trader/request.json",
+        response_path="agent/daily_trader/response.json",
+        status="COMPLETED",
+    )
+    session.add(quiet_invocation)
+    session.flush()
+    session.add(
+        AgentDecisionRecord(
+            run_id=quiet.id,
+            agent_invocation_id=quiet_invocation.id,
+            schema_version=2,
+            status="NO_ACTION",
+            abstention_classification="DELIBERATE_WAIT",
+            abstention_json='{"classification":"DELIBERATE_WAIT"}',
+            dissent_dispositions_json="[]",
+            raw_json='{"schema_version":2,"status":"NO_ACTION"}',
+        )
+    )
+    session.commit()
     after = _run(session, key="daily:2026-08-24", scheduled_for=end + timedelta(days=2))
     record_performance_snapshot(
         session,
@@ -229,6 +257,13 @@ def test_weekly_performance_aggregates_only_the_requested_period(tmp_path: Path)
     assert performance.no_action_run_count == 1
     assert quiet.id != inside.id
     assert performance.has_sample() is True
+
+    quiet.status = "FAILED"
+    session.commit()
+    failed_performance = load_weekly_performance(
+        session, period_start=start, period_end=end
+    )
+    assert failed_performance.no_action_run_count == 0
 
     empty = load_weekly_performance(
         session,

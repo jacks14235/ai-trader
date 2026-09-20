@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from trader.agent.codex_cli import (
     CodexCLIInvocationError,
+    InvocationResponse,
     StructuredReasoningProvider,
     codex_output_schema,
 )
@@ -30,7 +31,7 @@ from trader.agent.config import (
     ModelProfile,
     RoleName,
 )
-from trader.persistence.models import AgentInvocation
+from trader.persistence.models import AgentInvocation, BookEvaluation
 from trader.persistence.repositories import associate_agent_invocation_evidence
 
 STEP_PATTERN = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
@@ -135,6 +136,8 @@ def invoke_role[OutputModel: BaseModel](
     provider: StructuredReasoningProvider,
     validate: Callable[[OutputModel], OutputModel] | None = None,
     on_output: Callable[[OutputModel, str], None] | None = None,
+    book_id: str | None = None,
+    book_evaluation_id: str | None = None,
 ) -> RoleInvocationResult[OutputModel]:
     """Invoke one role against a bounded context and persist the whole exchange.
 
@@ -144,6 +147,12 @@ def invoke_role[OutputModel: BaseModel](
     """
     role_config, profile = resolve_role(config, workflow.role)
     _verify_parent(session, run_id=run_id, workflow=workflow)
+    _verify_book_scope(
+        session,
+        run_id=run_id,
+        book_id=book_id,
+        book_evaluation_id=book_evaluation_id,
+    )
 
     prompt_text = prompt.strip()
     context_json = canonical_json(context)
@@ -175,6 +184,8 @@ def invoke_role[OutputModel: BaseModel](
             "provider": profile.provider,
             "model": profile.model,
             "reasoning_effort": profile.reasoning_effort,
+            "book_id": book_id,
+            "book_evaluation_id": book_evaluation_id,
             "prompt_hash": prompt_hash,
             "context_hash": context_hash,
             "context_sources": list(role_config.context_sources),
@@ -191,12 +202,16 @@ def invoke_role[OutputModel: BaseModel](
 
     invocation = AgentInvocation(
         run_id=run_id,
+        book_id=book_id,
+        book_evaluation_id=book_evaluation_id,
         role=workflow.role,
         step=workflow.step,
         attempt=workflow.attempt,
         parent_invocation_id=workflow.parent_invocation_id,
         purpose=f"{workflow.role}_{config.mode}",
         model=profile.model or "codex-cli-default",
+        model_profile=role_config.profile,
+        reasoning_effort=profile.reasoning_effort,
         provider=provider.provider_name,
         prompt_version=prompt_hash,
         request_path=f"{artifact_directory}/request.json",
@@ -218,6 +233,7 @@ def invoke_role[OutputModel: BaseModel](
             timeout_seconds=role_config.timeout_seconds,
             max_output_chars=role_config.max_output_chars,
         )
+        _record_usage(session, invocation_id=invocation_id, response=response)
         (directory / "provider_stdout.log").write_text(response.stdout, encoding="utf-8")
         (directory / "provider_stderr.log").write_text(response.stderr, encoding="utf-8")
         try:
@@ -236,8 +252,6 @@ def invoke_role[OutputModel: BaseModel](
         completed = session.get(AgentInvocation, invocation_id)
         assert completed is not None
         completed.response_path = f"{artifact_directory}/response.json"
-        completed.input_token_count = response.input_token_count
-        completed.output_token_count = response.output_token_count
         completed.completed_at = datetime.now(UTC)
         completed.status = "COMPLETED"
         session.commit()
@@ -255,6 +269,8 @@ def invoke_role[OutputModel: BaseModel](
         if isinstance(exc, CodexCLIInvocationError):
             (directory / "provider_stdout.log").write_text(exc.stdout, encoding="utf-8")
             (directory / "provider_stderr.log").write_text(exc.stderr, encoding="utf-8")
+            if exc.usage is not None:
+                _record_usage(session, invocation_id=invocation_id, response=exc.usage)
         _write_json(
             directory / "failure.json",
             {"error_type": type(exc).__name__, "message": str(exc)},
@@ -266,6 +282,32 @@ def invoke_role[OutputModel: BaseModel](
             failed.error_summary = str(exc)[:4_000]
             session.commit()
         raise
+
+
+def _record_usage(
+    session: Session,
+    *,
+    invocation_id: str,
+    response: InvocationResponse,
+) -> None:
+    if response.cost_source not in {"NOT_REPORTED", "CLI_REPORTED"}:
+        raise ValueError(f"unsupported inference cost source: {response.cost_source}")
+    invocation = session.get(AgentInvocation, invocation_id)
+    if invocation is None:
+        raise ValueError("cannot record usage for an unknown agent invocation")
+    payload = response.usage_payload()
+    invocation.input_token_count = response.input_token_count
+    invocation.cached_input_token_count = response.cached_input_token_count
+    invocation.output_token_count = response.output_token_count
+    invocation.reasoning_output_token_count = response.reasoning_output_token_count
+    invocation.total_token_count = response.total_token_count
+    invocation.usage_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    invocation.cost_usd = None if response.cost_usd is None else str(response.cost_usd)
+    invocation.cost_source = response.cost_source
+    # Codex CLI currently reports token usage, not a pricing table. Preserve NULL rather than
+    # applying API prices to a potentially subscription-backed invocation.
+    invocation.pricing_json = None
+    session.commit()
 
 
 def workflow_trail(session: Session, run_id: str) -> tuple[AgentInvocation, ...]:
@@ -311,6 +353,27 @@ def _verify_parent(session: Session, *, run_id: str, workflow: WorkflowStep) -> 
         raise LookupError(f"parent invocation not found: {workflow.parent_invocation_id}")
     if parent.run_id != run_id:
         raise ValueError("a child invocation must belong to its parent's run")
+
+
+def _verify_book_scope(
+    session: Session,
+    *,
+    run_id: str,
+    book_id: str | None,
+    book_evaluation_id: str | None,
+) -> None:
+    if (book_id is None) != (book_evaluation_id is None):
+        raise ValueError("book invocation requires both book and evaluation IDs")
+    if book_id is None:
+        return
+    evaluation = session.get(BookEvaluation, book_evaluation_id)
+    if (
+        evaluation is None
+        or evaluation.book_id != book_id
+        or evaluation.run_id != run_id
+        or evaluation.status != "STARTED"
+    ):
+        raise ValueError("book invocation must belong to this run's active book evaluation")
 
 
 def _write_json(path: Path, value: object) -> None:

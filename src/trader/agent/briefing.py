@@ -178,7 +178,15 @@ def _noticed_block(decision: DailyDecision | None) -> str:
         return ""
     counter = _section("The strongest case against today", decision.strongest_counterargument)
     noticed = _section("What the trader noticed", decision.market_assessment)
-    return noticed + counter
+    dissent = ""
+    if decision.dissent_dispositions:
+        lines = [
+            f"- `{item.packet_step}/{item.claim_id}` — **{item.resolution.lower()}**: "
+            f"{item.rationale}"
+            for item in decision.dissent_dispositions
+        ]
+        dissent = _section("How the manager addressed dissent", "\n".join(lines))
+    return noticed + counter + dissent
 
 
 def _trades_block(facts: DailyBriefingFacts) -> str:
@@ -188,12 +196,31 @@ def _trades_block(facts: DailyBriefingFacts) -> str:
             "Nothing was proposed, so nothing was sent to the risk engine.",
         )
     if facts.decision.status == "NO_ACTION":
-        reason = facts.decision.no_action_reason or "No reason was recorded."
+        abstention = facts.decision.abstention
+        assert abstention is not None
+        revisit = (
+            abstention.reconsider_at.isoformat()
+            if abstention.reconsider_at is not None
+            else abstention.reconsider_on
+        )
+        triggers = "\n".join(
+            f"- **{trigger.kind.lower()}**: {trigger.description}"
+            for trigger in abstention.triggers
+        )
+        unavailable = (
+            "\n\n**Unavailable data:** " + "; ".join(abstention.unavailable_data)
+            if abstention.unavailable_data
+            else ""
+        )
         return _section(
             "What was traded",
             "The daily trader chose not to propose a trade. That is a complete decision, "
             "not a missing one.\n\n"
-            f"**Why it sat still:** {reason}",
+            f"**Why it sat still:** {abstention.insufficient_evidence}\n\n"
+            f"**Classification:** {abstention.classification.lower().replace('_', ' ')}"
+            f"{unavailable}\n\n"
+            f"**What would change the decision:**\n{triggers}\n\n"
+            f"**Reconsider:** {revisit}",
         )
     risk_by_id = {item.proposal_id: item for item in facts.risk_decisions}
     cards = [

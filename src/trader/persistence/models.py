@@ -10,6 +10,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     MetaData,
     String,
     Text,
@@ -394,6 +395,13 @@ class AgentInvocation(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    # Populated for every invocation belonging to a simulated book, including packet steps.
+    book_id: Mapped[str | None] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    book_evaluation_id: Mapped[str | None] = mapped_column(
+        String, index=True
+    )
     role: Mapped[str] = mapped_column(String)
     # The empty string is the role's only step; named steps belong to multi-step workflows.
     step: Mapped[str] = mapped_column(String, default="")
@@ -404,12 +412,23 @@ class AgentInvocation(Base):
     )
     purpose: Mapped[str] = mapped_column(String)
     model: Mapped[str] = mapped_column(String)
+    model_profile: Mapped[str | None] = mapped_column(String)
+    reasoning_effort: Mapped[str | None] = mapped_column(String)
     provider: Mapped[str] = mapped_column(String)
     prompt_version: Mapped[str] = mapped_column(String)
     request_path: Mapped[str] = mapped_column(Text)
     response_path: Mapped[str | None] = mapped_column(Text)
     input_token_count: Mapped[int | None] = mapped_column()
+    cached_input_token_count: Mapped[int | None] = mapped_column()
     output_token_count: Mapped[int | None] = mapped_column()
+    reasoning_output_token_count: Mapped[int | None] = mapped_column()
+    total_token_count: Mapped[int | None] = mapped_column()
+    usage_json: Mapped[str | None] = mapped_column(Text)
+    cost_usd: Mapped[str | None] = mapped_column(String)
+    cost_source: Mapped[str] = mapped_column(
+        String, default="NOT_REPORTED", server_default="NOT_REPORTED"
+    )
+    pricing_json: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String, default="STARTED")
@@ -449,6 +468,58 @@ class AgentInvocationEvidence(Base):
         index=True,
     )
     ordinal: Mapped[int] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgentDecisionRecord(Base):
+    """Queryable terminal decision data retained independently of run artifacts."""
+
+    __tablename__ = "agent_decisions"
+    __table_args__ = (
+        UniqueConstraint("agent_invocation_id"),
+        UniqueConstraint("run_id", "book_id"),
+        CheckConstraint("status IN ('NO_ACTION', 'PROPOSE_TRADES')", name="valid_status"),
+        CheckConstraint(
+            "(status = 'NO_ACTION' AND abstention_json IS NOT NULL) OR "
+            "(status = 'PROPOSE_TRADES' AND abstention_json IS NULL)",
+            name="consistent_abstention",
+        ),
+        CheckConstraint(
+            "(book_id IS NULL AND book_evaluation_id IS NULL) OR "
+            "(book_id IS NOT NULL AND book_evaluation_id IS NOT NULL)",
+            name="consistent_book_scope",
+        ),
+        Index("ix_agent_decisions_run_created", "run_id", "created_at"),
+        Index(
+            "uq_agent_decisions_live_run",
+            "run_id",
+            unique=True,
+            sqlite_where=text("book_id IS NULL"),
+            postgresql_where=text("book_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    agent_invocation_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_invocations.id", ondelete="CASCADE"),
+        index=True,
+    )
+    # NULL is the live decision line; a value identifies one internally simulated book.
+    book_id: Mapped[str | None] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"),
+        index=True,
+    )
+    book_evaluation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("book_evaluations.id", ondelete="CASCADE"),
+        index=True,
+    )
+    schema_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String, index=True)
+    abstention_classification: Mapped[str | None] = mapped_column(String, index=True)
+    abstention_json: Mapped[str | None] = mapped_column(Text)
+    dissent_dispositions_json: Mapped[str] = mapped_column(Text, default="[]")
+    raw_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
@@ -609,12 +680,112 @@ class Book(Base):
     # hash with the recorded version, and a divergent variant simply does not.
     strategy_document_path: Mapped[str] = mapped_column(Text)
     strategy_content_hash: Mapped[str] = mapped_column(String, index=True)
+    process_profile: Mapped[str] = mapped_column(
+        String, default="single_pass", server_default="single_pass"
+    )
+    operating_note_path: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String, default="active", index=True)
     starting_cash: Mapped[str] = mapped_column(String)
     description: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class BookExperimentPhase(Base):
+    """An immutable configuration interval, appended in book evaluation order."""
+
+    __tablename__ = "book_experiment_phases"
+    __table_args__ = (
+        UniqueConstraint("book_id", "ordinal"),
+        CheckConstraint("ordinal > 0", name="positive_ordinal"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    book_id: Mapped[str] = mapped_column(ForeignKey("books.id"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    configuration_hash: Mapped[str] = mapped_column(String, index=True)
+    manifest_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class BookEvaluation(Base):
+    """A durable evaluation claim, including failures and its exact experiment phase."""
+
+    __tablename__ = "book_evaluations"
+    __table_args__ = (
+        UniqueConstraint("book_id", "run_id"),
+        CheckConstraint("status IN ('STARTED', 'COMPLETED', 'FAILED')", name="valid_status"),
+        CheckConstraint(
+            "(status = 'STARTED' AND terminal_invocation_id IS NULL AND error IS NULL) OR "
+            "(status = 'COMPLETED' AND terminal_invocation_id IS NOT NULL AND error IS NULL) OR "
+            "(status = 'FAILED' AND terminal_invocation_id IS NULL AND error IS NOT NULL)",
+            name="consistent_outcome",
+        ),
+        Index("ix_book_evaluations_book_as_of", "book_id", "as_of"),
+        Index(
+            "uq_book_evaluations_active_book",
+            "book_id",
+            unique=True,
+            sqlite_where=text("status = 'STARTED'"),
+            postgresql_where=text("status = 'STARTED'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    book_id: Mapped[str] = mapped_column(ForeignKey("books.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    phase_id: Mapped[str] = mapped_column(ForeignKey("book_experiment_phases.id"), index=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String, default="STARTED", server_default="STARTED")
+    manifest_json: Mapped[str] = mapped_column(Text)
+    terminal_invocation_id: Mapped[str | None] = mapped_column(ForeignKey("agent_invocations.id"))
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class BookReferencePoint(Base):
+    """One model-free cash or SPY reference observation aligned to a book evaluation."""
+
+    __tablename__ = "book_reference_points"
+    __table_args__ = (
+        UniqueConstraint("book_id", "run_id", "kind"),
+        CheckConstraint("kind IN ('CASH', 'SPY_BUY_HOLD')", name="valid_kind"),
+        CheckConstraint("status IN ('COMPLETED', 'FAILED')", name="valid_status"),
+        CheckConstraint(
+            "(status = 'COMPLETED' AND equity IS NOT NULL AND cash IS NOT NULL "
+            "AND error IS NULL) OR "
+            "(status = 'FAILED' AND equity IS NULL AND cash IS NULL AND error IS NOT NULL)",
+            name="consistent_outcome",
+        ),
+        Index("ix_book_reference_points_book_as_of", "book_id", "as_of"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    book_id: Mapped[str] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    evaluation_id: Mapped[str] = mapped_column(
+        ForeignKey("book_evaluations.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String)
+    symbol: Mapped[str | None] = mapped_column(String)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String)
+    starting_cash: Mapped[str] = mapped_column(String)
+    equity: Mapped[str | None] = mapped_column(String)
+    cash: Mapped[str | None] = mapped_column(String)
+    quantity: Mapped[str | None] = mapped_column(String)
+    entry_price: Mapped[str | None] = mapped_column(String)
+    mark_price: Mapped[str | None] = mapped_column(String)
+    commission: Mapped[str | None] = mapped_column(String)
+    quote_bid: Mapped[str | None] = mapped_column(String)
+    quote_ask: Mapped[str | None] = mapped_column(String)
+    quote_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    definition_hash: Mapped[str] = mapped_column(String, index=True)
+    definition_json: Mapped[str] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class SimulatedFill(Base):

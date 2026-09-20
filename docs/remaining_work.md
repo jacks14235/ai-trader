@@ -1,6 +1,6 @@
 # Paper Trader: Remaining Work and Raspberry Pi Handoff
 
-Last updated: 2026-08-22
+Last updated: 2026-09-19
 
 This document tracks the work remaining after the initial Raspberry Pi deployment. The Pi is reported to be running the trader, but its service definitions and installation procedure are not currently stored in this repository. Some verification items below may already be complete on the Pi; in that case, the remaining task is to record the configuration and evidence so the deployment is reproducible.
 
@@ -15,7 +15,12 @@ The application currently has:
 - A paper canary command for testing the real submission path with a small notional order.
 - A `STOP_TRADING` kill switch and an emergency halt command.
 - Duplicate-run protection and a test-rerun mode that cannot submit orders.
-- Local verification of the current implementation with 223 passing tests, Ruff, and strict source mypy.
+- A verified simulated-book process-profile slice: typed research/adversary packets,
+  book-specific contexts and operating notes, durable experiment phases/evaluations, active waiting
+  memory with machine-checked reopen conditions, and deterministic cash/SPY reference curves. See
+  [the implementation contract](process_profiles_plan.md) for scope and acceptance checks.
+- Local verification covers the full suite, migration round trips and contention, lint, and strict
+  source type checking. No broker submission was used for this slice.
 
 The last documented live-account checks were against Alpaca paper only. A weekend canary was correctly rejected as outside the trading window, and a full daily test run completed with `NO_ACTION` and a clean reconciliation.
 
@@ -204,13 +209,35 @@ The agent should receive a curated evidence set relevant to its questions, not t
 
 ## P2: Strategy and memory system
 
-### Compactor
+### Process profiles and compactor
 
-The compactor role is configurable but is not yet part of the run lifecycle.
+The current steps 1–6 slice runs profiles for **simulated books only**. It adds the `single_pass`
+and `research_then_adversary` catalog entries, typed cited packets, deterministic prompt composition,
+role-specific context projections, and a common profile executor. The incumbent daily context,
+prompt, unnamed invocation, and paper-execution gates stay unchanged. Acceptance verification is
+tracked in [process_profiles_plan.md](process_profiles_plan.md), not inferred from this checklist.
 
-- [ ] Convert completed run evidence into concise, cited thesis/memory updates.
-- [ ] Prevent the compactor from changing strategy or placing trades.
-- [ ] Preserve superseded versions and source links.
+Packets separate facts, attributed source claims, and interpretations. Invocation IDs, packet
+hashes, local claim IDs, and every consumed predecessor make communication reconstructable;
+they do not establish that the manager used or benefited from a packet. Missing collection is
+unknown, not proof of source omission.
+
+- [x] Add addressed dissent: every consumed contradiction/dissent claim is recorded as accepted,
+      rejected, or deferred with admitted evidence; deferral requires a concrete trigger.
+- [x] Add structured waiting records with evidence gaps, price/evidence/event triggers, future
+      reconsideration conditions, and an explicit distinction between deliberate abstention, data
+      unavailability, and failed evaluation.
+- [x] Require relevant new inputs, a satisfied price trigger, or a due review before reopening an
+      unchanged book idea. Named events remain unresolved until typed event context exists.
+- [ ] Add typed, bounded model-requested follow-up collection; profile steps currently summarize
+      the existing research bundle. See [research design](research_pipeline_design.md).
+- [ ] Add pre-outcome predictions and independent resolution procedures.
+- [ ] Evaluate trade and wait decisions, inference costs, and process variants in controlled forward
+      trials; hold starting conditions/configuration fixed and retain failed experiments.
+      Detailed per-invocation and per-book token accounting is implemented; Codex CLI does not
+      currently expose monetary pricing or billed cost.
+- [ ] Convert useful packet conclusions into versioned longer-term memory with source links, without
+      granting the compactor authority to mutate strategy or theses.
 
 ### Weekly strategist
 
@@ -236,10 +263,21 @@ cannot contaminate the live decision line (`book_id IS NULL` on live readers).
 - [x] Authorize book proposals with the same risk engine against the book's own account.
 - [x] Isolate book failures so they cannot abort the live daily run.
 - [x] Cap the active roster so variants stay cheap but not free.
-- [ ] Spawn a book from a weekly strategy proposal instead of applying the edit to the live document.
+- [ ] Implement the future CEO book-proposal contract and full typed inbox dispatch from
+      [process_profiles_plan.md](process_profiles_plan.md#future-ceo-specification--not-implemented-by-steps-16).
+      No `PROPOSE_BOOK` status or weekly prompt change is part of steps 1–6. Approval will record a
+      decision only; instantiation remains human-owned, with pending/approved-unopened reservations.
+- [ ] Add a bounded sequence of previous reviews, resolutions, and outstanding trials to CEO memory.
+      “Continue unchanged” is a complete outcome; one action per week is a ceiling, not a quota.
 - [ ] Show book equity curves in the weekly review so a variant is judged on path, not argument.
+- [x] Persist flat-cash and one-time SPY buy-and-hold reference curves for every completed book
+      evaluation. These are deterministic comparisons, not agent books.
 - [ ] Promote or demote: move capital (or the live document) only after a book's curve earns it.
-- [ ] Attribute book outcomes to the strategy version they opened under.
+Book configuration and input attribution are part of the current slice: strategy/profile/config
+versions, note and prompt hashes, model settings, evidence manifests, and simulated execution
+assumptions are retained by experiment phase and evaluation. A → B → A creates three phases.
+Null model selections are explicitly unpinned experiments. Outcome scoring by those phases remains
+future work; the same strategy/evidence alone does not establish a causal process improvement.
 
 ### Knowledge and performance review
 
@@ -283,5 +321,35 @@ During the first week, review every run and reconciliation result manually. That
 5. Observe five trading days and fix operational failures.
 6. Implement the event-trader pipeline.
 7. Expand event sources and bounded web research.
-8. Add the compactor, and schedule the weekly strategist alongside the daily timer.
+8. Schedule the existing weekly strategist; book-only compactor integration belongs to the current
+   profile slice. Do not expand weekly permissions implicitly.
 
+## Before the first controlled book experiment
+
+These are operator decisions, not missing code. A trial started without them is still auditable,
+but its curves will not support a process comparison.
+
+- [ ] Pin a model slug in `config/agents.yaml`. Both profiles currently set `model: null`, which
+      `book_experiment_phases` records as `model_identity_pinned: false`. A provider default that
+      moves mid-trial changes the variable under test.
+- [ ] Bound the book stage against the market close. Books run sequentially after live execution in
+      `created_at` order, and the risk engine rejects every proposal once `market_is_open` is false.
+      With eight three-step books at the configured timeouts, how many decisions a book is allowed
+      to make depends on its position in the queue. Start earlier, limit how many books use a
+      multi-step profile, or record closed-market evaluations so they can be excluded.
+- [ ] Open books on the machine that will run them. `books.strategy_document_path` and
+      `operating_note_path` are resolved absolute paths, so a repository move or a database
+      restored to a different location fails every book's evaluation in isolation.
+
+## Research development order after steps 1–6
+
+1. Complete profile/book integration checks before running any experiment.
+2. Run the first controlled books against the deterministic cash and SPY curves; inspect structured
+   waits and their machine-checked reopen records during the trial.
+3. Add bounded follow-up research using typed conditions.
+4. Record predictions and measure controlled forward book experiments, including failures and cost.
+5. Extend CEO context and the human proposal inbox; only then design bounded simulated lifecycle
+   automation separately from brokerage execution.
+6. Design short-stock support and options support as separate reviewed instrument expansions.
+   Current paper-only, long-only, no-margin rules remain binding. Swappable decision/execution
+   boundaries do not authorize either expansion or real trading.

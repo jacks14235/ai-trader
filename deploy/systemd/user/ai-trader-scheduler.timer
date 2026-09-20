@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AI Trader scheduler tick every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=ai-trader-scheduler.service
+
+[Install]
+WantedBy=timers.target

@@ -73,6 +73,69 @@ class RecentRunDecision(LedgerModel):
     proposals: tuple[DecisionOutcome, ...] = ()
 
 
+class PriorWaitTrigger(LedgerModel):
+    """A trigger copied from the latest completed abstention for one book."""
+
+    trigger_id: str = Field(min_length=1, max_length=64)
+    kind: Literal["PRICE", "EVIDENCE", "EVENT"]
+    description: str
+    symbol: str | None = None
+    comparison: Literal["AT_OR_BELOW", "AT_OR_ABOVE"] | None = None
+    target_price: Decimal | None = None
+    evidence_needed: str | None = None
+    event: str | None = None
+
+
+class PriorWaitDecision(LedgerModel):
+    """Latest completed no-action decision before deterministic trigger assessment."""
+
+    decision_id: str
+    invocation_id: str
+    run_id: str
+    scheduled_for: datetime
+    classification: Literal["DELIBERATE_WAIT", "DATA_UNAVAILABLE"]
+    insufficient_evidence: str
+    unavailable_data: tuple[str, ...] = ()
+    triggers: tuple[PriorWaitTrigger, ...]
+    reconsider_at: datetime | None = None
+    reconsider_on: str | None = None
+    scope_symbols: tuple[str, ...] = ()
+    prior_evidence_content_hashes: tuple[str, ...] = ()
+
+
+class WaitTriggerAssessment(LedgerModel):
+    """Machine-checkable status of one prior wait trigger at the current cutoff."""
+
+    trigger_id: str
+    kind: Literal["PRICE", "EVIDENCE", "EVENT"]
+    description: str
+    status: Literal["SATISFIED", "UNSATISFIED", "UNRESOLVED"]
+    reason: str
+    symbol: str | None = None
+    current_price: Decimal | None = None
+    comparison: Literal["AT_OR_BELOW", "AT_OR_ABOVE"] | None = None
+    target_price: Decimal | None = None
+
+
+class WaitingDecisionMemory(LedgerModel):
+    """A prior abstention plus the exact changes that may justify reopening it."""
+
+    decision_id: str
+    invocation_id: str
+    run_id: str
+    scheduled_for: datetime
+    classification: Literal["DELIBERATE_WAIT", "DATA_UNAVAILABLE"]
+    insufficient_evidence: str
+    unavailable_data: tuple[str, ...] = ()
+    reconsider_at: datetime | None = None
+    reconsider_on: str | None = None
+    scope_symbols: tuple[str, ...] = ()
+    review_due: bool
+    new_evidence_ids: tuple[str, ...] = ()
+    trigger_assessments: tuple[WaitTriggerAssessment, ...]
+    reopenable: bool
+
+
 class PerformanceMetrics(LedgerModel):
     """Equity-curve metrics for one run, computed from persisted snapshots only."""
 

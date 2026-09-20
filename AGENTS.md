@@ -108,7 +108,7 @@ orders off. Only weekly strategist may set `can_mutate_knowledge`.
 
 | Role | Status |
 | --- | --- |
-| `research_compactor` | Configured; not invoked yet |
+| `research_compactor` | Wired for simulated-book process profiles only |
 | `daily_trader` | Wired; gated by `TRADER_REASONING_ENABLED` + `automatic_daily_run` |
 | `event_trader` | Configured; event runs currently record `NO_ACTION` |
 | `weekly_strategist` | Wired; gated by `TRADER_STRATEGIST_ENABLED`; proposes only |
@@ -117,6 +117,13 @@ Invocation is `codex exec` with stdin + JSON schema: ephemeral, ignore user/proj
 web/shell, approvals never, sandbox read-only. Prompt, context, schema, hashes, provider logs, and
 token counts are retained under the run directory and `agent_invocations`. Invalid symbols or
 invented evidence IDs fail the run.
+
+Invocation accounting is explicit: each row retains configured model profile/model/reasoning effort,
+run and optional book/evaluation scope, timestamps, input/cached-input/output/reasoning-output/total
+tokens, raw normalized usage JSON, and provider-reported cost/pricing when available. Codex CLI
+currently reports token detail but no monetary price or billed cost; record `NOT_REPORTED` and NULL
+rather than estimating API cost for subscription-backed CLI calls. Usage survives later output
+validation or evaluation failure once the provider has reported it.
 
 ## Role invocation
 
@@ -139,6 +146,14 @@ invocations in order and is what `trader runs show` prints under `agents`.
 `ShadowDailyReasoningPipeline` is now just the daily composition over this primitive: assemble the
 daily context, invoke `daily_trader`, validate against that context, persist proposals.
 
+Simulated books may instead use a human-owned process from `config/pipelines.yaml`. The catalog is
+strictly bounded to `MAX_PROFILE_STEPS = 5`; the supplied `single_pass` profile uses one manager
+call, while `research_then_adversary` produces two typed cited `ResearchPacket`s before the terminal
+manager decision. Research roles receive no account, positions, strategy, theses, market-data
+adapter, or execution interface. All consumed packet IDs and hashes are retained in profile
+artifacts; packet and claim IDs are provenance, not new evidence IDs. The incumbent daily context,
+prompt, and unnamed invocation are unchanged.
+
 `DailyDecision` is `NO_ACTION` or `PROPOSE_TRADES` (max 10). Proposals may only `BUY` or `SELL`,
 cite admitted evidence, and use a symbol from the slate or current positions. The same object must
 include `daily_update`: a beginner-facing briefing (headline, lesson, overview, next-day plan, plus
@@ -146,6 +161,13 @@ optional teaching sections, glossary, and charts). After risk and execution, Pyt
 prose into `templates/daily_update.html` with what was actually approved or submitted. The model
 cannot claim a fill it has not seen. If reasoning is disabled, the same template is filled with a
 deterministic note that no model wrote the story.
+
+`NO_ACTION` requires a structured abstention: deliberate wait vs unavailable data, the exact
+evidence gap, one or more typed price/evidence/event triggers, and a future time or named event for
+reconsideration. A provider or pipeline failure is never recorded as abstention. When a terminal
+manager consumes research packets, validation requires exactly one accepted/rejected/deferred
+disposition for every contradiction and dissent claim. Dispositions cite admitted source IDs;
+deferral also names a typed trigger.
 
 `context_sources` is enforced, not decorative: `verify_context_sources` maps every declared source
 to the context fields that satisfy it and aborts when a role declares one its assembler cannot
@@ -232,29 +254,52 @@ as a new superseding version.
 
 ## Simulated books
 
-A book is a simulated portfolio for one strategy variant. It has its own cash, positions, and
-equity curve. Nothing in `books/` may reach a broker: quotes come through a `MarketDataSource`
-(quote/asset/clock only), and fills are produced by `books/simulator.py`. The simulator crosses
-the spread, fills all-or-nothing, settles at the same instant, and refuses a stale or missing
-quote. Those assumptions are recorded on every fill.
+A book is a simulated portfolio for one strategy variant and one catalogued process profile. It has
+its own cash, positions, equity curve, optional project-contained operating note, and immutable
+experiment history. Nothing in `books/` may reach a broker: quotes come through a
+`MarketDataSource` (quote/asset/clock only), and fills are produced by `books/simulator.py`. The
+simulator crosses the spread, fills all-or-nothing, settles at the same instant, and refuses a stale
+or missing quote. Those assumptions are recorded on every fill.
 
 State is **derived**, not stored: `load_book_state` replays `simulated_fills` from `starting_cash`.
 Authorization is the same `risk.engine.evaluate` used by the live line, against the book's own
-account. The live risk policy still binds (`expected_max_equity_usd` is 2500), so starting cash
-should stay at or below that ceiling.
+account. A book's authorized symbol set is the run's shared slate plus **its own** holdings, mirroring
+how the live line admits the portfolio's positions; otherwise a variant could not exit a position
+once its symbol left the slate. Per-day order and trade counters use the Eastern trading day, as the
+live line does. Starting cash must be positive and no greater than the loaded
+`risk.yaml` `expected_max_equity_usd`; code must not duplicate that human-owned number.
 
 Live vs book isolation: `trade_proposals.book_id` and `performance_snapshots.book_id` are `NULL`
 for the live line. `load_recent_decisions`, `load_weekly_performance`, and `load_equity_curve`
-filter `book_id IS NULL` unless a book is requested. Books get no theses; their memory is their
-own prior proposals and simulated fills. The roster is capped at `MAX_ACTIVE_BOOKS = 8` because
-each active book costs one `daily_trader` invocation per day (`WorkflowStep` step `book_<name>`).
-A book failure is isolated and cannot abort the live run.
+filter `book_id IS NULL` unless a book is requested. Books get no theses; their memory is their own
+prior proposals and simulated fills. The roster is capped at `MAX_ACTIVE_BOOKS = 8`. Each active
+book costs one to five model calls according to its selected profile; supplied workflow steps are
+namespaced `book_<uuidhex>_<slug>_<step>`. A book failure, including a missing or invalid optional
+catalog, is isolated and cannot abort the live run.
+
+Research rows are loaded once for all books and projected separately under each role's context
+limits. Consumed packets are reserved before raw excerpts are trimmed. The research plan must match
+the supplied scan exactly. The causal context cutoff advances from scan time to the latest retained
+same-run retrieval; checks use underlying market observation timestamps rather than Alpaca's
+retrieval stamp, and observations after the causal cutoff fail closed. Held-position valuation also
+rejects mismatched, malformed, stale, or future quotes. Performance readers exclude snapshots after
+their cutoff.
+
+`book_experiment_phases` records immutable effective configuration. `book_evaluations` records each
+book/run claim, exact changing inputs, status, and terminal invocation. A partial unique index allows
+only one `STARTED` evaluation per book, while the book/run key permanently prevents replay. Use
+`books recover-evaluation` only after the parent run is `FAILED` and all invocations for that book
+are resolved; the command records reviewer and note and never retries the interrupted run.
 
 Open one with a copy of the strategy document:
 
 ```bash
 cp knowledge/strategy.md knowledge/books/mean-reversion.md
-uv run trader books open mean-reversion --cash 2000 --strategy knowledge/books/mean-reversion.md
+# Create knowledge/books/mean-reversion-note.md with the desk's research instructions.
+uv run trader books open mean-reversion --cash 2000 \
+  --strategy knowledge/books/mean-reversion.md \
+  --profile research_then_adversary \
+  --operating-note knowledge/books/mean-reversion-note.md
 ```
 
 Spawning a book from a weekly proposal is not implemented. The strategist still edits the one
@@ -295,7 +340,9 @@ uv run trader daily-run
 uv run trader daily-run --test-rerun
 uv run trader weekly-run [--as-of ISO] [--test-rerun]
 uv run trader strategy proposals|show ID|approve ID --reviewer NAME|reject ID --reviewer NAME
-uv run trader books list|open NAME --cash N --strategy PATH|show NAME|pause|resume|retire
+uv run trader books list|open NAME --cash N --strategy PATH [--profile NAME] [--operating-note PATH]
+uv run trader books show NAME|pause NAME|resume NAME|retire NAME
+uv run trader books recover-evaluation EVALUATION_ID --reviewer NAME --note TEXT
 uv run trader reconcile          # never submits; exit 1 on mismatch
 uv run trader halt               # STOP_TRADING + cancel open orders
 uv run trader portfolio
@@ -304,6 +351,7 @@ uv run trader paper-canary --symbol SPY --notional 25 [--submit]
 uv run trader universe scan
 uv run trader research plan
 uv run trader agents validate
+uv run trader agents usage [--book NAME] [--model MODEL]
 uv run trader events discover|today|list|add|cancel
 uv run trader schedule list|create|cancel
 uv run trader scheduler-tick
@@ -331,11 +379,22 @@ Implemented: paper broker adapter, audit schema, universe scan, Alpaca+SEC shado
 BEA/file event discovery, durable scheduler, the role-agnostic invocation primitive, daily trader
 reasoning with enforced context sources and prior-decision memory, the decision-quality ledger with
 fill-derived thesis outcomes and content-hashed strategy versions, the weekly strategy review with
-its human approval path, simulated strategy books with isolated daily evaluation, risk engine,
-paper canary, and daily-run wiring of proposals → risk → executor/reconciler.
+its human approval path, simulated strategy books with isolated profile-driven research teams,
+durable experiment phases/evaluations, risk engine, paper canary, and daily-run wiring of proposals
+→ risk → executor/reconciler. Terminal decisions are queryable in `agent_decisions`: no-action
+requires structured waiting conditions, and consumed contradiction/dissent claims require explicit
+evidence-cited manager dispositions.
+Book decision rows point to their exact `book_evaluations` row. Attempted terminal reasoning remains
+auditable after a later evaluation failure, but completed-decision readers require a completed
+evaluation whose terminal invocation exactly matches the decision.
+The latest completed book abstention is active waiting memory. Price/time conditions and new source
+content are assessed deterministically, and a manager reopening that wait must cite the exact
+machine-observed change. Each book also receives model-free flat-cash and one-time SPY buy-and-hold
+reference points; these are comparison curves, not agent books.
 
-Not yet: research-compactor packets, event-trader invocation, web/paid providers, automatic
-promotion or demotion of a book, weekly review of book equity curves. See
+Not yet: model-requested follow-up research, event-trader invocation, web/paid providers, CEO book
+proposals, automatic promotion or demotion of a book, or scored weekly review of book equity curves.
+See
 `docs/research_pipeline_design.md` before expanding research and `docs/remaining_work.md` for the
 deployment and launch checklist.
 

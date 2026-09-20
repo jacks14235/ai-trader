@@ -1,7 +1,7 @@
 """Strict, human-owned configuration for every reasoning role."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -20,6 +20,7 @@ ContextSource = Literal[
     "open_orders",
     "candidate_overview",
     "deep_research",
+    "research_packets",
     "scheduled_event",
     "recent_decisions",
     "open_theses",
@@ -99,9 +100,7 @@ class AgentRoleConfig(AgentConfigModel):
 
     @field_validator("context_sources")
     @classmethod
-    def unique_context_sources(
-        cls, values: tuple[ContextSource, ...]
-    ) -> tuple[ContextSource, ...]:
+    def unique_context_sources(cls, values: tuple[ContextSource, ...]) -> tuple[ContextSource, ...]:
         if not values or len(values) != len(set(values)):
             raise ValueError("context sources must be nonempty and unique")
         return values
@@ -153,11 +152,7 @@ class AgentConfig(AgentConfigModel):
 
 def load_agent_config(path: Path, *, project_root: Path | None = None) -> AgentConfig:
     """Load strict role configuration and verify prompt paths stay inside the project."""
-    try:
-        with path.open(encoding="utf-8") as stream:
-            content = yaml.safe_load(stream)
-    except (OSError, yaml.YAMLError) as exc:
-        raise ValueError(f"cannot load configuration {path}: {exc}") from exc
+    content = load_unique_yaml(path)
     config = AgentConfig.model_validate(content)
     root = (project_root or path.parent.parent).resolve()
     for role_name, role in config.roles.items():
@@ -170,3 +165,38 @@ def load_agent_config(path: Path, *, project_root: Path | None = None) -> AgentC
 def resolved_prompt_path(config_path: Path, role: AgentRoleConfig) -> Path:
     """Resolve a previously validated role prompt relative to the project root."""
     return (config_path.parent.parent.resolve() / role.prompt).resolve()
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML without silently replacing an earlier mapping entry."""
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[object, object]:
+        if not isinstance(node, yaml.MappingNode):
+            raise yaml.constructor.ConstructorError(
+                None, None, "expected a mapping", node.start_mark
+            )
+        self.flatten_mapping(node)
+        result: dict[object, object] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in result
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    None, None, "mapping key must be hashable", key_node.start_mark
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate YAML mapping key: {key!r}", key_node.start_mark
+                )
+            result[key] = self.construct_object(value_node, deep=deep)
+        return result
+
+
+def load_unique_yaml(path: Path) -> object:
+    """Read human-owned configuration, rejecting duplicate keys at every depth."""
+    try:
+        with path.open(encoding="utf-8") as stream:
+            return yaml.load(stream, Loader=_UniqueKeyLoader)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot load configuration {path}: {exc}") from exc

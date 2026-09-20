@@ -196,6 +196,8 @@ def record_performance_snapshot(
     """
     if not account.equity.is_finite() or not account.cash.is_finite():
         raise ValueError("account equity and cash must be finite to record performance")
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("performance snapshot cutoff must be timezone-aware")
     same_curve = (
         PerformanceSnapshot.book_id.is_(None)
         if book_id is None
@@ -220,6 +222,7 @@ def record_performance_snapshot(
         .where(
             PerformanceSnapshot.run_id != run_id,
             PerformanceSnapshot.period == period,
+            PerformanceSnapshot.captured_at < as_of,
             same_curve,
         )
         .order_by(PerformanceSnapshot.captured_at.desc(), PerformanceSnapshot.id.desc())

@@ -11,14 +11,20 @@ from sqlalchemy.orm import Session
 from trader.ledger.models import (
     DecisionOutcome,
     OpenThesis,
+    PriorWaitDecision,
+    PriorWaitTrigger,
     ProposalAction,
     RecentRunDecision,
 )
 from trader.persistence.models import (
+    AgentDecisionRecord,
+    AgentInvocationEvidence,
+    BookEvaluation,
     BrokerOrderRecord,
     DailyReport,
     Fill,
     PerformanceSnapshot,
+    ResearchItem,
     RiskDecisionRecord,
     Run,
     SimulatedFill,
@@ -36,6 +42,84 @@ MAX_RATIONALE_CHARS = 800
 MAX_SUMMARY_CHARS = 1_200
 MAX_INVALIDATION_CONDITIONS = 8
 MAX_EQUITY_POINTS = 30
+
+
+def load_latest_book_wait(
+    session: Session,
+    *,
+    book_id: str,
+    exclude_run_id: str,
+    as_of: datetime,
+) -> PriorWaitDecision | None:
+    """Load the book's latest completed decision when it is an active abstention.
+
+    A later completed trade decision supersedes an older wait. Failed evaluations and decisions
+    whose terminal invocation does not match the completed evaluation never become memory.
+    """
+    record = session.scalar(
+        select(AgentDecisionRecord)
+        .join(BookEvaluation, BookEvaluation.id == AgentDecisionRecord.book_evaluation_id)
+        .join(Run, Run.id == AgentDecisionRecord.run_id)
+        .where(
+            AgentDecisionRecord.book_id == book_id,
+            AgentDecisionRecord.run_id != exclude_run_id,
+            Run.scheduled_for <= as_of,
+            BookEvaluation.book_id == book_id,
+            BookEvaluation.status == "COMPLETED",
+            BookEvaluation.terminal_invocation_id
+            == AgentDecisionRecord.agent_invocation_id,
+        )
+        .order_by(Run.scheduled_for.desc(), AgentDecisionRecord.created_at.desc())
+        .limit(1)
+    )
+    if record is None or record.status != "NO_ACTION" or record.abstention_json is None:
+        return None
+    try:
+        abstention = json.loads(record.abstention_json)
+        raw = json.loads(record.raw_json)
+        triggers = tuple(PriorWaitTrigger.model_validate(item) for item in abstention["triggers"])
+        classification = abstention["classification"]
+        insufficient = abstention["insufficient_evidence"]
+        unavailable = tuple(abstention.get("unavailable_data", ()))
+        reconsider_at_raw = abstention.get("reconsider_at")
+        reconsider_at = (
+            None if reconsider_at_raw is None else datetime.fromisoformat(reconsider_at_raw)
+        )
+        reconsider_on = abstention.get("reconsider_on")
+        watchlist = tuple(raw.get("watchlist", ()))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"stored wait decision {record.id} is invalid") from exc
+    scope = tuple(
+        sorted({*watchlist, *(item.symbol for item in triggers if item.symbol is not None)})
+    )
+    hashes = tuple(
+        session.scalars(
+            select(ResearchItem.content_hash)
+            .join(
+                AgentInvocationEvidence,
+                AgentInvocationEvidence.research_id == ResearchItem.id,
+            )
+            .where(AgentInvocationEvidence.agent_invocation_id == record.agent_invocation_id)
+            .order_by(AgentInvocationEvidence.ordinal)
+        )
+    )
+    run = session.get(Run, record.run_id)
+    if run is None:
+        raise ValueError(f"stored wait decision {record.id} has no run")
+    return PriorWaitDecision(
+        decision_id=record.id,
+        invocation_id=record.agent_invocation_id,
+        run_id=record.run_id,
+        scheduled_for=run.scheduled_for,
+        classification=classification,
+        insufficient_evidence=insufficient,
+        unavailable_data=unavailable,
+        triggers=triggers,
+        reconsider_at=reconsider_at,
+        reconsider_on=reconsider_on,
+        scope_symbols=scope,
+        prior_evidence_content_hashes=hashes,
+    )
 
 
 def load_recent_decisions(

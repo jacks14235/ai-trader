@@ -17,7 +17,7 @@ from trader.agent.briefing import (
     render_daily_update,
 )
 from trader.agent.runtime import DailyReasoningPipeline
-from trader.books.runtime import BookEvaluationPipeline, BookEvaluationResult
+from trader.books.runtime import BookEvaluationResult, BookEvaluationService
 from trader.broker.base import Broker
 from trader.broker.models import Account
 from trader.execution.reconciliation import Reconciler
@@ -118,7 +118,7 @@ def daily_run(
     research_pipeline: ResearchPipeline | None = None,
     reasoning_pipeline: DailyReasoningPipeline | None = None,
     risk_execution_pipeline: DailyRiskExecutionPipeline | None = None,
-    book_evaluation_pipeline: BookEvaluationPipeline | None = None,
+    book_evaluation_pipeline: BookEvaluationService | None = None,
     research_event_symbols: tuple[str, ...] = (),
     test_rerun: bool = False,
 ) -> str:

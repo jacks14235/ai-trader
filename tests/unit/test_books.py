@@ -1,5 +1,6 @@
 import hashlib
 import inspect
+import shutil
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
+from trader.agent.catalog import load_pipeline_catalog
 from trader.agent.codex_cli import InvocationResponse
 from trader.agent.config import load_agent_config
 from trader.agent.models import TradeProposal
@@ -194,6 +196,7 @@ class DailyRunResearch:
             persisted_research_ids=("research-1",),
             elapsed_seconds=0.1,
         )
+
 
 PROJECT_ROOT = Path(__file__).parents[2]
 AS_OF = datetime(2026, 8, 22, 19, 15, tzinfo=UTC)
@@ -444,11 +447,7 @@ def test_book_proposals_never_contaminate_the_live_decision_line(tmp_path: Path)
         exclude_run_id="review",
         as_of=AS_OF + timedelta(days=1),
     )
-    symbols = {
-        outcome.symbol
-        for record in live_memory
-        for outcome in record.proposals
-    }
+    symbols = {outcome.symbol for record in live_memory for outcome in record.proposals}
     assert "SPY" in symbols
     assert "QQQ" not in symbols
 
@@ -458,11 +457,7 @@ def test_book_proposals_never_contaminate_the_live_decision_line(tmp_path: Path)
         as_of=AS_OF + timedelta(days=1),
         book_id=book.id,
     )
-    book_symbols = {
-        outcome.symbol
-        for record in book_memory
-        for outcome in record.proposals
-    }
+    book_symbols = {outcome.symbol for record in book_memory for outcome in record.proposals}
     assert book_symbols == {"QQQ"}
 
     performance = load_weekly_performance(
@@ -489,6 +484,8 @@ def test_the_book_pipeline_settles_against_its_own_cash_and_never_submits(
         prompt="Return structured output only.",
         portfolio_policy="# Policy\n",
         provider=BookProvider(decision),
+        catalog=_catalog(),
+        project_root=tmp_path,
     )
 
     result = pipeline.run(
@@ -535,6 +532,8 @@ def test_one_book_failing_does_not_block_the_others(tmp_path: Path) -> None:
         prompt="Return structured output only.",
         portfolio_policy="# Policy\n",
         provider=BookProvider(_decision(research_id)),
+        catalog=_catalog(),
+        project_root=tmp_path,
     )
 
     result = pipeline.run(
@@ -590,9 +589,7 @@ def test_the_books_package_cannot_reach_a_broker() -> None:
         PROJECT_ROOT / "src" / "trader" / "books" / "service.py",
     ):
         imports = [
-            line
-            for line in path.read_text().splitlines()
-            if line.startswith(("import ", "from "))
+            line for line in path.read_text().splitlines() if line.startswith(("import ", "from "))
         ]
         assert not [line for line in imports if "trader.broker.base" in line]
         assert not [line for line in imports if "trader.execution" in line]
@@ -628,9 +625,12 @@ def test_books_migration_round_trips_and_guards_recorded_history(tmp_path: Path)
 
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT book_id FROM performance_snapshots WHERE id = 'snap-1'")
-        ).scalar_one() is None
+        assert (
+            connection.execute(
+                text("SELECT book_id FROM performance_snapshots WHERE id = 'snap-1'")
+            ).scalar_one()
+            is None
+        )
         assert "books" in sa_inspect(engine).get_table_names()
 
     command.downgrade(config, "b7e5109c34aa")
@@ -770,6 +770,7 @@ def _open(
     name: str = "control",
     cash: str = "2000",
 ) -> Book:
+    shutil.copytree(PROJECT_ROOT / "prompts", tmp_path / "prompts", dirs_exist_ok=True)
     path = tmp_path / f"{name}.md"
     if not path.is_file():
         path.write_text(STRATEGY)
@@ -779,6 +780,11 @@ def _open(
         starting_cash=Decimal(cash),
         strategy_document_path=path,
         as_of=AS_OF,
+        project_root=tmp_path,
+        catalog=_catalog(),
+        max_starting_cash=load_risk_config(
+            PROJECT_ROOT / "config/risk.yaml"
+        ).portfolio.expected_max_equity_usd,
     )
 
 
@@ -841,4 +847,11 @@ def _decision(research_id: str) -> DailyDecision:
                 max_acceptable_price="10.05",
             ),
         ),
+    )
+
+
+def _catalog():
+    return load_pipeline_catalog(
+        PROJECT_ROOT / "config/pipelines.yaml",
+        load_agent_config(PROJECT_ROOT / "config/agents.yaml"),
     )

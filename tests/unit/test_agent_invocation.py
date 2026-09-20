@@ -5,8 +5,13 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
+from typer.testing import CliRunner
 
-from trader.agent.codex_cli import InvocationResponse
+from trader.agent.codex_cli import (
+    CodexCLIInvocationError,
+    InvocationResponse,
+    _response_usage,
+)
 from trader.agent.config import AgentConfig, ModelProfile, load_agent_config
 from trader.agent.invocation import (
     WorkflowStep,
@@ -15,6 +20,7 @@ from trader.agent.invocation import (
     resolve_role,
     workflow_trail,
 )
+from trader.cli import app
 from trader.persistence.db import create_session_factory
 from trader.persistence.models import AgentInvocation, Run
 
@@ -51,6 +57,65 @@ class FailingProvider:
 
     def invoke(self, **kwargs: object) -> InvocationResponse:
         raise RuntimeError("provider is unavailable")
+
+
+class UsageProvider:
+    provider_name = "test"
+
+    def __init__(self, response: str, *, fail: bool = False) -> None:
+        self.response = response
+        self.fail = fail
+
+    def invoke(self, **kwargs: object) -> InvocationResponse:
+        usage = InvocationResponse(
+            self.response,
+            "stdout",
+            "",
+            input_token_count=1_000,
+            output_token_count=250,
+            cached_input_token_count=400,
+            reasoning_output_token_count=100,
+        )
+        if self.fail:
+            raise CodexCLIInvocationError(
+                "provider failed after usage",
+                stdout="stdout",
+                stderr="",
+                usage=usage,
+            )
+        return usage
+
+
+def test_codex_usage_parser_retains_cached_reasoning_and_optional_cost() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 1_000,
+                        "cached_input_tokens": 400,
+                        "output_tokens": 250,
+                        "reasoning_output_tokens": 100,
+                        "cost_usd": "0.0125",
+                    },
+                }
+            ),
+        ]
+    )
+
+    usage = _response_usage(stdout)
+
+    assert usage.usage_payload() == {
+        "input_tokens": 1_000,
+        "cached_input_tokens": 400,
+        "output_tokens": 250,
+        "reasoning_output_tokens": 100,
+        "total_tokens": 1_250,
+        "cost_usd": "0.0125",
+        "cost_source": "CLI_REPORTED",
+    }
 
 
 def test_workflow_step_gives_every_invocation_its_own_artifact_directory() -> None:
@@ -224,7 +289,7 @@ def test_a_rejected_output_leaves_no_derived_rows(tmp_path: Path) -> None:
             context=_context(),
             output_model=Packet,
             admitted_evidence_ids=(),
-            provider=RecordingProvider(Packet(finding="invented").model_dump_json()),
+            provider=UsageProvider(Packet(finding="invented").model_dump_json()),
             validate=refuse,
             on_output=lambda packet, invocation_id: derived.append(invocation_id),
         )
@@ -233,7 +298,69 @@ def test_a_rejected_output_leaves_no_derived_rows(tmp_path: Path) -> None:
     trail = workflow_trail(session, run.id)
     assert [item.status for item in trail] == ["FAILED"]
     assert trail[0].response_path is None
+    assert trail[0].input_token_count == 1_000
+    assert trail[0].cached_input_token_count == 400
+    assert trail[0].output_token_count == 250
+    assert trail[0].reasoning_output_token_count == 100
+    assert trail[0].total_token_count == 1_250
+    assert json.loads(trail[0].usage_json) == {
+        "input_tokens": 1_000,
+        "cached_input_tokens": 400,
+        "output_tokens": 250,
+        "reasoning_output_tokens": 100,
+        "total_tokens": 1_250,
+        "cost_usd": None,
+        "cost_source": "NOT_REPORTED",
+    }
     assert not (run_directory / "agent" / "research_compactor" / "response.json").exists()
+
+
+def test_failed_cli_invocation_retains_reported_usage(tmp_path: Path) -> None:
+    session, run, config = _state(tmp_path)
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+
+    with pytest.raises(CodexCLIInvocationError, match="failed after usage"):
+        _invoke(
+            session,
+            config,
+            run,
+            run_directory,
+            UsageProvider(Packet(finding="unused").model_dump_json(), fail=True),
+            WorkflowStep(role="daily_trader"),
+        )
+
+    invocation = workflow_trail(session, run.id)[0]
+    assert invocation.status == "FAILED"
+    assert invocation.total_token_count == 1_250
+    assert invocation.cost_source == "NOT_REPORTED"
+
+
+def test_agent_usage_command_aggregates_models_and_live_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session, run, config = _state(tmp_path)
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    _invoke(
+        session,
+        config,
+        run,
+        run_directory,
+        UsageProvider(Packet(finding="counted").model_dump_json()),
+        WorkflowStep(role="daily_trader"),
+    )
+    monkeypatch.setattr("trader.cli.database_service", lambda: (object(), session))
+
+    result = CliRunner().invoke(app, ["agents", "usage"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["totals"]["invocation_count"] == 1
+    assert payload["totals"]["total_tokens"] == 1_250
+    assert payload["by_model"]["gpt-5.6-sol"]["cached_input_tokens"] == 400
+    assert payload["by_book"]["live"]["reasoning_output_tokens"] == 100
+    assert payload["totals"]["reported_cost_usd"] is None
 
 
 def test_disabled_roles_and_foreign_parents_are_refused(tmp_path: Path) -> None:
