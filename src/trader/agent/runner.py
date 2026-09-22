@@ -39,7 +39,7 @@ from trader.risk.runtime import DailyRiskExecutionPipeline
 from trader.scheduling.discovery import EventDiscoveryService
 from trader.universe.scanner import CandidateScanner
 
-SCHEDULE_TIME = "09:30"
+SCHEDULE_TIME = "15:15"
 SCHEDULE_ZONE = ZoneInfo("America/New_York")
 ALPACA_PAPER_FORCED_OPTIONS_LEVEL = 3
 

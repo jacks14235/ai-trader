@@ -39,7 +39,16 @@ def _safe_text(value: str) -> str:
 
 
 LocalIdentifier = Annotated[
-    str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+    str,
+    Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+        description=(
+            "Lowercase snake_case identifier using only letters, digits, and underscores; "
+            "must start with a letter."
+        ),
+    ),
 ]
 ContentHash = Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
 ClaimText = Annotated[

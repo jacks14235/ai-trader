@@ -269,7 +269,7 @@ class FakeRiskExecutionPipeline:
 def test_run_key_uses_eastern_trading_date() -> None:
     when = datetime(2026, 8, 21, 2, tzinfo=UTC)
 
-    assert run_key(when) == "daily:2026-08-20:09:30:America/New_York"
+    assert run_key(when) == "daily:2026-08-20:15:15:America/New_York"
 
 
 def test_run_key_rejects_naive_time() -> None:

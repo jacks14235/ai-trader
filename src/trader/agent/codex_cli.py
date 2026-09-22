@@ -186,13 +186,17 @@ def codex_output_schema(schema: dict[str, object]) -> dict[str, object]:
 def _normalize_schema(value: object) -> object:
     if isinstance(value, dict):
         mapping = cast(dict[str, object], value)
-        normalized = {
-            key: _normalize_schema(item)
-            for key, item in mapping.items()
-            # Pydantic's Decimal regex uses lookaround, which the structured-output
-            # engine rejects. Runtime Pydantic validation remains authoritative.
-            if key not in {"default", "pattern"}
-        }
+        normalized: dict[str, object] = {}
+        for key, item in mapping.items():
+            if key == "default":
+                continue
+            # Structured Outputs supports string patterns, so retain constraints such as
+            # lowercase local identifiers and evidence hashes. Pydantic's Decimal regex uses
+            # lookaround, which the structured-output engine rejects; runtime Decimal validation
+            # remains authoritative for those fields.
+            if key == "pattern" and isinstance(item, str) and _uses_regex_lookaround(item):
+                continue
+            normalized[key] = _normalize_schema(item)
         properties = normalized.get("properties")
         if isinstance(properties, dict):
             normalized["required"] = list(properties)
@@ -201,6 +205,11 @@ def _normalize_schema(value: object) -> object:
     if isinstance(value, list):
         return [_normalize_schema(item) for item in value]
     return value
+
+
+def _uses_regex_lookaround(pattern: str) -> bool:
+    """Return whether a regex uses constructs rejected by the schema engine."""
+    return any(marker in pattern for marker in ("(?=", "(?!", "(?<=", "(?<!"))
 
 
 def _failure_detail(stdout: str, stderr: str) -> str:

@@ -70,7 +70,9 @@ Return only the response required by the supplied JSON schema.
   that would change the decision, and exactly one future reconsideration time or named event. Use
   `DELIBERATE_WAIT` when the available record supports waiting and leave `unavailable_data` empty.
   Use `DATA_UNAVAILABLE` only when named missing or stale data prevents a decision, and list those
-  inputs. A model or system failure is not a decision and must not be described as abstention.
+  inputs. Every `trigger_id` must be lowercase `snake_case` containing only letters, digits, and
+  underscores, such as `intc_quarterly_primary_evidence`; never use hyphens. A model or system
+  failure is not a decision and must not be described as abstention.
 - `dissent_dispositions`: for every `contradictions` or `dissent` claim in every consumed research
   packet, cite its exact `packet_step` and `claim_id`, then mark it `ACCEPTED`, `REJECTED`, or
   `DEFERRED`. Give a substantive rationale and exact admitted evidence IDs. Rejection means the

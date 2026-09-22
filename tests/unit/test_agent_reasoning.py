@@ -548,7 +548,7 @@ def test_codex_cli_uses_stdin_schema_ephemeral_read_only_and_no_shell(
     assert response.response_text == '{"status":"ok"}'
 
 
-def test_codex_output_schema_requires_every_property_and_removes_defaults() -> None:
+def test_codex_output_schema_requires_properties_and_preserves_supported_patterns() -> None:
     schema = codex_output_schema(DailyDecision.model_json_schema())
     properties = schema["properties"]
     assert isinstance(properties, dict)
@@ -567,7 +567,20 @@ def test_codex_output_schema_requires_every_property_and_removes_defaults() -> N
     assert isinstance(proposal_properties, dict)
     assert proposal["required"] == list(proposal_properties)
     assert '"default"' not in json.dumps(schema)
-    assert '"pattern"' not in json.dumps(schema)
+    wait_trigger = definitions["WaitTrigger"]
+    assert isinstance(wait_trigger, dict)
+    trigger_properties = wait_trigger["properties"]
+    assert isinstance(trigger_properties, dict)
+    trigger_id = trigger_properties["trigger_id"]
+    assert isinstance(trigger_id, dict)
+    assert trigger_id["pattern"] == r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+    notional = proposal_properties["target_notional_usd"]
+    assert isinstance(notional, dict)
+    notional_options = notional["anyOf"]
+    assert isinstance(notional_options, list)
+    assert all(
+        not isinstance(option, dict) or "pattern" not in option for option in notional_options
+    )
 
 
 def test_codex_cli_surfaces_jsonl_error_when_stderr_is_empty(
