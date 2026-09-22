@@ -76,7 +76,9 @@ Return only the response required by the supplied JSON schema.
   Use `DATA_UNAVAILABLE` only when named missing or stale data prevents a decision, and list those
   inputs. Every `trigger_id` must be lowercase `snake_case` containing only letters, digits, and
   underscores, such as `intc_quarterly_primary_evidence`; never use hyphens. A model or system
-  failure is not a decision and must not be described as abstention.
+  failure is not a decision and must not be described as abstention. Use only the fields belonging
+  to the selected trigger kind: `PRICE` has `symbol`, `comparison`, and `target_price`; `EVIDENCE`
+  has `evidence_needed`; and `EVENT` has `event`.
 - `dissent_dispositions`: for every `contradictions` or `dissent` claim in every consumed research
   packet, cite its exact `packet_step` and `claim_id`, then mark it `ACCEPTED`, `REJECTED`, or
   `DEFERRED`. Give a substantive rationale and exact admitted evidence IDs. Rejection means the

@@ -37,7 +37,12 @@ from trader.agent.profile_context import (
     project_book_context,
     project_research_context,
 )
-from trader.agent.reasoning import AbstentionRecord, DissentDisposition, WaitTrigger
+from trader.agent.reasoning import (
+    AbstentionRecord,
+    DissentDisposition,
+    EvidenceWaitTrigger,
+    PriceWaitTrigger,
+)
 from trader.agent.runtime import ShadowDailyReasoningPipeline
 from trader.books.models import FillAssumptions, SimulatedFillResult
 from trader.books.references import record_spy_reference
@@ -133,7 +138,7 @@ def no_action(evidence_id):
                 classification="DELIBERATE_WAIT",
                 insufficient_evidence="No decisive evidence.",
                 triggers=(
-                    WaitTrigger(
+                    PriceWaitTrigger(
                         trigger_id="spy_better_price",
                         kind="PRICE",
                         description="Wait for SPY to reach a more attractive entry.",
@@ -402,7 +407,7 @@ def test_manager_must_address_every_consumed_contradiction_and_dissent(tmp_path)
                     resolution="DEFERRED",
                     rationale="The alternative needs a specific confirming observation.",
                     evidence_ids=(evidence,),
-                    defer_until=WaitTrigger(
+                    defer_until=EvidenceWaitTrigger(
                         trigger_id="alternative_confirmation",
                         kind="EVIDENCE",
                         description="Reassess when the next primary-source update is available.",

@@ -179,64 +179,65 @@ class DailyUpdate(ReasoningModel):
         return _briefing_text(value)
 
 
-class WaitTrigger(ReasoningModel):
-    """One falsifiable condition that can make waiting worth reconsidering."""
-
+class _WaitTriggerBase(ReasoningModel):
     trigger_id: LocalIdentifier
-    kind: Literal["PRICE", "EVIDENCE", "EVENT"]
     description: str = Field(min_length=1, max_length=2_000)
-    symbol: str | None = None
-    comparison: Literal["AT_OR_BELOW", "AT_OR_ABOVE"] | None = None
-    target_price: Decimal | None = None
-    evidence_needed: str | None = Field(default=None, min_length=1, max_length=2_000)
-    event: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, value: str) -> str:
+        return _briefing_text(value)
+
+
+class PriceWaitTrigger(_WaitTriggerBase):
+    """A falsifiable price condition that can make waiting worth reconsidering."""
+
+    kind: Literal["PRICE"]
+    symbol: str
+    comparison: Literal["AT_OR_BELOW", "AT_OR_ABOVE"]
+    target_price: Decimal
 
     @field_validator("symbol")
     @classmethod
-    def normalized_symbol(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def normalized_symbol(cls, value: str) -> str:
         normalized = value.upper().strip()
         if not SYMBOL_PATTERN.fullmatch(normalized):
             raise ValueError("PRICE trigger symbol must be a valid uppercase equity symbol")
         return normalized
 
-    @field_validator("description", "evidence_needed", "event")
+    @field_validator("target_price")
     @classmethod
-    def clean_text(cls, value: str | None) -> str | None:
-        return None if value is None else _briefing_text(value)
+    def positive_target_price(cls, value: Decimal) -> Decimal:
+        if not value.is_finite() or value <= 0:
+            raise ValueError("PRICE trigger target_price must be positive and finite")
+        return value
 
-    @model_validator(mode="after")
-    def fields_match_kind(self) -> "WaitTrigger":
-        if self.kind == "PRICE":
-            if self.symbol is None or self.comparison is None or self.target_price is None:
-                raise ValueError("PRICE trigger requires symbol, comparison, and target_price")
-            if not self.target_price.is_finite() or self.target_price <= 0:
-                raise ValueError("PRICE trigger target_price must be positive and finite")
-            if self.evidence_needed is not None or self.event is not None:
-                raise ValueError("PRICE trigger cannot include evidence_needed or event")
-        elif self.kind == "EVIDENCE":
-            if self.evidence_needed is None:
-                raise ValueError("EVIDENCE trigger requires evidence_needed")
-            if any(
-                value is not None
-                for value in (self.symbol, self.comparison, self.target_price, self.event)
-            ):
-                raise ValueError("EVIDENCE trigger contains fields for another trigger kind")
-        else:
-            if self.event is None:
-                raise ValueError("EVENT trigger requires event")
-            if any(
-                value is not None
-                for value in (
-                    self.symbol,
-                    self.comparison,
-                    self.target_price,
-                    self.evidence_needed,
-                )
-            ):
-                raise ValueError("EVENT trigger contains fields for another trigger kind")
-        return self
+
+class EvidenceWaitTrigger(_WaitTriggerBase):
+    """A named evidence condition that can make waiting worth reconsidering."""
+
+    kind: Literal["EVIDENCE"]
+    evidence_needed: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("evidence_needed")
+    @classmethod
+    def clean_evidence_needed(cls, value: str) -> str:
+        return _briefing_text(value)
+
+
+class EventWaitTrigger(_WaitTriggerBase):
+    """A named event condition that can make waiting worth reconsidering."""
+
+    kind: Literal["EVENT"]
+    event: str = Field(min_length=1, max_length=500)
+
+    @field_validator("event")
+    @classmethod
+    def clean_event(cls, value: str) -> str:
+        return _briefing_text(value)
+
+
+WaitTrigger = PriceWaitTrigger | EvidenceWaitTrigger | EventWaitTrigger
 
 
 class AbstentionRecord(ReasoningModel):
@@ -670,7 +671,7 @@ def _validate_wait_reconsideration(
 
 
 def _validate_wait_trigger(trigger: WaitTrigger, admitted_symbols: set[str]) -> None:
-    if trigger.symbol is not None and trigger.symbol not in admitted_symbols:
+    if isinstance(trigger, PriceWaitTrigger) and trigger.symbol not in admitted_symbols:
         raise ValueError(f"wait trigger symbol was not admitted to this run: {trigger.symbol}")
 
 

@@ -21,6 +21,8 @@ from trader.agent.reasoning import (
     DailyAgentContext,
     DailyDecision,
     DailyUpdate,
+    EvidenceWaitTrigger,
+    PriceWaitTrigger,
     WaitReconsideration,
     WaitTrigger,
     assemble_daily_context,
@@ -269,7 +271,7 @@ def test_no_action_requires_testable_abstention_and_future_review(tmp_path: Path
         update={
             "abstention": _abstention(
                 reconsider_at=context.as_of + timedelta(days=1),
-                trigger=WaitTrigger(
+                trigger=PriceWaitTrigger(
                     trigger_id="foreign_price",
                     kind="PRICE",
                     description="Wait for a price outside the admitted slate.",
@@ -288,7 +290,7 @@ def test_no_action_requires_testable_abstention_and_future_review(tmp_path: Path
             classification="DATA_UNAVAILABLE",
             insufficient_evidence="A required filing was unavailable.",
             triggers=(
-                WaitTrigger(
+                EvidenceWaitTrigger(
                     trigger_id="filing_arrives",
                     kind="EVIDENCE",
                     description="Review after the filing can be collected.",
@@ -459,7 +461,7 @@ def test_shadow_pipeline_persists_invocation_and_never_executes(tmp_path: Path) 
             classification="DELIBERATE_WAIT",
             insufficient_evidence="Evidence is insufficient.",
             triggers=(
-                WaitTrigger(
+                PriceWaitTrigger(
                     trigger_id="spy_price_entry",
                     kind="PRICE",
                     description="Reconsider if SPY falls to the planned entry price.",
@@ -567,13 +569,25 @@ def test_codex_output_schema_requires_properties_and_preserves_supported_pattern
     assert isinstance(proposal_properties, dict)
     assert proposal["required"] == list(proposal_properties)
     assert '"default"' not in json.dumps(schema)
-    wait_trigger = definitions["WaitTrigger"]
-    assert isinstance(wait_trigger, dict)
-    trigger_properties = wait_trigger["properties"]
+    evidence_trigger = definitions["EvidenceWaitTrigger"]
+    assert isinstance(evidence_trigger, dict)
+    trigger_properties = evidence_trigger["properties"]
     assert isinstance(trigger_properties, dict)
     trigger_id = trigger_properties["trigger_id"]
     assert isinstance(trigger_id, dict)
     assert trigger_id["pattern"] == r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+    assert set(trigger_properties) == {"trigger_id", "description", "kind", "evidence_needed"}
+    abstention = definitions["AbstentionRecord"]
+    assert isinstance(abstention, dict)
+    abstention_properties = abstention["properties"]
+    assert isinstance(abstention_properties, dict)
+    triggers = abstention_properties["triggers"]
+    assert isinstance(triggers, dict)
+    trigger_items = triggers["items"]
+    assert isinstance(trigger_items, dict)
+    trigger_options = trigger_items["anyOf"]
+    assert isinstance(trigger_options, list)
+    assert len(trigger_options) == 3
     notional = proposal_properties["target_notional_usd"]
     assert isinstance(notional, dict)
     notional_options = notional["anyOf"]
@@ -632,7 +646,7 @@ def _abstention(
         insufficient_evidence="The available evidence does not establish a decisive signal.",
         triggers=(
             trigger
-            or WaitTrigger(
+            or EvidenceWaitTrigger(
                 trigger_id="stronger_evidence",
                 kind="EVIDENCE",
                 description="Reconsider when independent evidence confirms the setup.",
