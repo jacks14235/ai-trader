@@ -72,6 +72,7 @@ class BoundedResearchCollector:
             "MARKET_CONTEXT",
             "COMPANY_NEWS",
             "SEC_FILINGS",
+            "SEC_FILING_HISTORY",
         }
         if missing:
             raise ValueError(f"unsupported research routes: {sorted(missing)}")
@@ -158,7 +159,13 @@ def write_research_artifacts(
     artifacts: dict[str, ResearchArtifact] = {}
     for batch in collection.batches:
         for document in batch.documents:
-            path = f"{batch.provider}/{document.research_id}.json"
+            suffix = (
+                "html"
+                if document.source_name
+                in {"SEC EDGAR primary filing document", "SEC EDGAR issuer exhibit"}
+                else "json"
+            )
+            path = f"{batch.provider}/{document.research_id}.{suffix}"
             artifact = writer.write_bytes(path, document.raw_payload)
             # Identical evidence may satisfy several questions or symbol batches. The
             # immutable writer verifies its bytes and makes that reuse idempotent.

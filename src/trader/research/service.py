@@ -3,7 +3,7 @@
 import hashlib
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -14,12 +14,12 @@ from sqlalchemy.orm import Session
 from trader.persistence.repositories import persist_research_item
 from trader.research.artifacts import ImmutableResearchArtifactWriter, ResearchArtifact
 from trader.research.collection import (
-    BoundedResearchCollector,
     ResearchCollection,
     write_research_artifacts,
 )
 from trader.research.config import ResearchConfig
-from trader.research.models import ResearchDocument, ResearchPlan
+from trader.research.models import ResearchDocument, ResearchPlan, ResearchQuestion
+from trader.research.selection import DeepSelectionAssessment
 from trader.universe.models import UniverseScan
 
 
@@ -35,6 +35,10 @@ class ResearchPlanBuilder(Protocol):
         portfolio_symbols: tuple[str, ...] = (),
         event_symbols: tuple[str, ...] = (),
     ) -> ResearchPlan: ...
+
+
+class ResearchCollector(Protocol):
+    def collect(self, requests: Sequence[ResearchQuestion]) -> ResearchCollection: ...
 
 
 class ResearchPipeline(Protocol):
@@ -59,6 +63,11 @@ class ResearchRunResult:
     reference_artifacts: dict[str, ResearchArtifact] | None = None
     setup_request_count: int = 0
     setup_response_bytes: int = 0
+    deep_selection: tuple[DeepSelectionAssessment, ...] = ()
+    follow_up_invocation_id: str | None = None
+    follow_up_requested_count: int = 0
+    follow_up_granted_count: int = 0
+    follow_up_new_document_count: int = 0
 
     @property
     def unique_document_count(self) -> int:
@@ -78,6 +87,7 @@ class ResearchRunResult:
             "mode": "shadow",
             "candidate_count": len(self.plan.candidate_symbols),
             "deep_symbol_count": len(self.plan.deep_symbols),
+            "deep_selection_screened_count": len(self.deep_selection),
             "question_count": len(self.plan.questions),
             "provider_batches": len(self.collection.batches),
             "http_request_count": self.total_request_count,
@@ -86,6 +96,10 @@ class ResearchRunResult:
             "unique_document_count": self.unique_document_count,
             "persisted_research_ids": list(self.persisted_research_ids),
             "elapsed_seconds": round(self.elapsed_seconds, 6),
+            "follow_up_invocation_id": self.follow_up_invocation_id,
+            "follow_up_requested_count": self.follow_up_requested_count,
+            "follow_up_granted_count": self.follow_up_granted_count,
+            "follow_up_new_document_count": self.follow_up_new_document_count,
         }
 
 
@@ -96,7 +110,7 @@ class ShadowResearchPipeline:
         self,
         session: Session,
         planner: ResearchPlanBuilder,
-        collector: BoundedResearchCollector,
+        collector: ResearchCollector,
         config: ResearchConfig,
         *,
         reference_payloads: Mapping[str, bytes] | None = None,
@@ -154,94 +168,13 @@ class ShadowResearchPipeline:
             _collection_manifest(collection, artifacts),
         )
         reference_artifacts["research_collection.json"] = collection_artifact
-        questions = {question.question_id: question for question in plan.questions}
-        question_order = tuple(question.question_id for question in plan.questions)
-        persisted_ids: list[str] = []
-        seen_persisted: set[str] = set()
-        for content_hash, documents in sorted(_documents_by_content(collection).items()):
-            canonical = min(
-                documents,
-                key=lambda document: (
-                    document.provider,
-                    document.source_name,
-                    document.provider_item_id,
-                    document.research_id,
-                ),
-            )
-            artifact = artifacts[canonical.research_id]
-            database_id = _run_scoped_research_id(run_id, content_hash)
-            symbols = tuple(
-                sorted({symbol for document in documents for symbol in document.symbols})
-            )
-            admitted_question_ids = {
-                question_id
-                for document in documents
-                for question_id in document.question_ids
-            }
-            unknown_question_ids = admitted_question_ids.difference(questions)
-            if unknown_question_ids:
-                raise ResearchPipelineError(
-                    f"content {content_hash} references unknown questions: "
-                    + ", ".join(sorted(unknown_question_ids))
-                )
-            source_observations = [
-                {
-                    "research_id": document.research_id,
-                    "provider": document.provider,
-                    "source_name": document.source_name,
-                    "provider_item_id": document.provider_item_id,
-                    "headline": document.headline,
-                    "symbols": list(document.symbols),
-                    "question_ids": list(document.question_ids),
-                    "raw_artifact_path": (
-                        f"research/{artifacts[document.research_id].relative_path}"
-                    ),
-                }
-                for document in sorted(documents, key=lambda item: item.research_id)
-            ]
-            canonical_headline = (
-                canonical.headline
-                if len(source_observations) == 1
-                else (
-                    f"Deduplicated identical {canonical.source_type.lower()} payload "
-                    f"observed in {len(source_observations)} research contexts"
-                )
-            )
-            for question_id in question_order:
-                if question_id not in admitted_question_ids:
-                    continue
-                question = questions[question_id]
-                record = persist_research_item(
-                    self.session,
-                    research_id=database_id,
-                    run_id=run_id,
-                    symbols=symbols,
-                    source_tier=canonical.source_tier,
-                    source_type=canonical.source_type,
-                    source_name=canonical.source_name,
-                    provider=canonical.provider,
-                    provider_item_id=canonical.provider_item_id,
-                    research_question_id=question.question_id,
-                    research_question=question.query,
-                    raw_artifact_path=f"research/{artifact.relative_path}",
-                    normalized_summary=canonical.summary or canonical_headline,
-                    normalized_text=canonical.normalized_text,
-                    published_at=canonical.published_at,
-                    retrieved_at=canonical.retrieved_at,
-                    content_hash=canonical.content_hash,
-                    headline=canonical_headline,
-                    url=canonical.url,
-                    author=canonical.author,
-                    metadata={
-                        **canonical.metadata,
-                        "collector_research_id": canonical.research_id,
-                        "source_observations": source_observations,
-                    },
-                    cost_usd=canonical.cost_usd,
-                )
-                if record.id not in seen_persisted:
-                    persisted_ids.append(record.id)
-                    seen_persisted.add(record.id)
+        persisted_ids = _persist_documents(
+            self.session,
+            run_id=run_id,
+            collection=collection,
+            questions=plan.questions,
+            artifacts=artifacts,
+        )
 
         elapsed = self.setup_elapsed_seconds + (time.monotonic() - started)
         if elapsed > self.config.collection.max_wall_clock_seconds:
@@ -251,7 +184,7 @@ class ShadowResearchPipeline:
             plan=plan,
             collection=collection,
             artifacts=artifacts,
-            persisted_research_ids=tuple(persisted_ids),
+            persisted_research_ids=persisted_ids,
             elapsed_seconds=elapsed,
             reference_artifacts=reference_artifacts,
             setup_request_count=self.setup_request_count,
@@ -263,33 +196,219 @@ class ShadowResearchPipeline:
         collection: ResearchCollection,
         elapsed_seconds: float,
     ) -> None:
-        policy = self.config.collection
-        if elapsed_seconds > policy.max_wall_clock_seconds:
-            raise ResearchPipelineError("research collection exceeded its wall-clock budget")
-        if self.setup_request_count + collection.request_count > policy.max_total_requests:
-            raise ResearchPipelineError("research collection exceeded its request budget")
-        if (
-            self.setup_response_bytes + collection.response_bytes
-            > policy.max_total_response_bytes
-        ):
-            raise ResearchPipelineError("research collection exceeded its response-byte budget")
+        _validate_collection_policy(
+            collection,
+            config=self.config,
+            setup_request_count=self.setup_request_count,
+            setup_response_bytes=self.setup_response_bytes,
+            elapsed_seconds=elapsed_seconds,
+        )
 
-        documents = _unique_documents(collection)
-        if len(documents) > policy.max_total_items:
-            raise ResearchPipelineError("research collection exceeded its item budget")
-        by_symbol: dict[str, set[str]] = defaultdict(set)
-        for document in collection.documents:
-            for symbol in document.symbols:
-                by_symbol[symbol].add(document.research_id)
-        if any(
-            len(research_ids) > policy.max_items_per_symbol
-            for research_ids in by_symbol.values()
-        ):
-            raise ResearchPipelineError("research collection exceeded its per-symbol item budget")
 
-        cost = sum((batch.cost_usd for batch in collection.batches), Decimal("0"))
-        if cost > self.config.paid.max_per_run_usd:
-            raise ResearchPipelineError("research collection exceeded its paid-provider budget")
+def extend_research_result(
+    session: Session,
+    *,
+    run_id: str,
+    run_directory: Path,
+    base: ResearchRunResult,
+    questions: tuple[ResearchQuestion, ...],
+    collection: ResearchCollection,
+    config: ResearchConfig,
+    new_deep_symbols: tuple[str, ...],
+    follow_up_invocation_id: str,
+    requested_count: int,
+    elapsed_seconds: float,
+) -> ResearchRunResult:
+    """Append the one bounded follow-up round without rewriting first-round artifacts."""
+
+    combined_collection = ResearchCollection(
+        batches=base.collection.batches + collection.batches,
+        request_count=base.collection.request_count + collection.request_count,
+        response_bytes=base.collection.response_bytes + collection.response_bytes,
+    )
+    _validate_collection_policy(
+        combined_collection,
+        config=config,
+        setup_request_count=base.setup_request_count,
+        setup_response_bytes=base.setup_response_bytes,
+        elapsed_seconds=elapsed_seconds,
+    )
+    writer = ImmutableResearchArtifactWriter(run_directory / "research")
+    follow_up_artifacts = write_research_artifacts(collection, writer)
+    manifest = writer.write_json(
+        "research_follow_up_collection.json",
+        _collection_manifest(collection, follow_up_artifacts),
+    )
+    existing_hashes = {document.content_hash for document in base.collection.documents}
+    new_ids = _persist_documents(
+        session,
+        run_id=run_id,
+        collection=collection,
+        questions=questions,
+        artifacts=follow_up_artifacts,
+        excluded_content_hashes=existing_hashes,
+    )
+    deep_symbols = tuple(dict.fromkeys((*base.plan.deep_symbols, *new_deep_symbols)))
+    if len(deep_symbols) > 12:
+        raise ResearchPipelineError("follow-up research exceeds the hard deep-symbol cap")
+    plan = ResearchPlan(
+        as_of=base.plan.as_of,
+        candidate_symbols=base.plan.candidate_symbols,
+        deep_symbols=deep_symbols,
+        questions=base.plan.questions + questions,
+    )
+    references = dict(base.reference_artifacts or {})
+    references["research_follow_up_collection.json"] = manifest
+    return ResearchRunResult(
+        plan=plan,
+        collection=combined_collection,
+        artifacts={**base.artifacts, **follow_up_artifacts},
+        persisted_research_ids=tuple(dict.fromkeys((*base.persisted_research_ids, *new_ids))),
+        elapsed_seconds=elapsed_seconds,
+        reference_artifacts=references,
+        setup_request_count=base.setup_request_count,
+        setup_response_bytes=base.setup_response_bytes,
+        deep_selection=base.deep_selection,
+        follow_up_invocation_id=follow_up_invocation_id,
+        follow_up_requested_count=requested_count,
+        follow_up_granted_count=len(questions),
+        follow_up_new_document_count=len(new_ids),
+    )
+
+
+def _validate_collection_policy(
+    collection: ResearchCollection,
+    *,
+    config: ResearchConfig,
+    setup_request_count: int,
+    setup_response_bytes: int,
+    elapsed_seconds: float,
+) -> None:
+    policy = config.collection
+    if elapsed_seconds > policy.max_wall_clock_seconds:
+        raise ResearchPipelineError("research collection exceeded its wall-clock budget")
+    if setup_request_count + collection.request_count > policy.max_total_requests:
+        raise ResearchPipelineError("research collection exceeded its request budget")
+    if setup_response_bytes + collection.response_bytes > policy.max_total_response_bytes:
+        raise ResearchPipelineError("research collection exceeded its response-byte budget")
+    documents = _unique_documents(collection)
+    if len(documents) > policy.max_total_items:
+        raise ResearchPipelineError("research collection exceeded its item budget")
+    by_symbol: dict[str, set[str]] = defaultdict(set)
+    for document in collection.documents:
+        for symbol in document.symbols:
+            by_symbol[symbol].add(document.research_id)
+    if any(
+        len(research_ids) > policy.max_items_per_symbol
+        for research_ids in by_symbol.values()
+    ):
+        raise ResearchPipelineError("research collection exceeded its per-symbol item budget")
+    cost = sum((batch.cost_usd for batch in collection.batches), Decimal("0"))
+    if cost > config.paid.max_per_run_usd:
+        raise ResearchPipelineError("research collection exceeded its paid-provider budget")
+
+
+def _persist_documents(
+    session: Session,
+    *,
+    run_id: str,
+    collection: ResearchCollection,
+    questions: tuple[ResearchQuestion, ...],
+    artifacts: Mapping[str, ResearchArtifact],
+    excluded_content_hashes: set[str] | None = None,
+) -> tuple[str, ...]:
+    question_by_id = {question.question_id: question for question in questions}
+    question_order = tuple(question.question_id for question in questions)
+    persisted_ids: list[str] = []
+    seen_persisted: set[str] = set()
+    excluded = excluded_content_hashes or set()
+    for content_hash, documents in sorted(_documents_by_content(collection).items()):
+        if content_hash in excluded:
+            continue
+        canonical = min(
+            documents,
+            key=lambda document: (
+                document.provider,
+                document.source_name,
+                document.provider_item_id,
+                document.research_id,
+            ),
+        )
+        artifact = artifacts[canonical.research_id]
+        database_id = _run_scoped_research_id(run_id, content_hash)
+        symbols = tuple(
+            sorted({symbol for document in documents for symbol in document.symbols})
+        )
+        admitted_question_ids = {
+            question_id
+            for document in documents
+            for question_id in document.question_ids
+        }
+        unknown_question_ids = admitted_question_ids.difference(question_by_id)
+        if unknown_question_ids:
+            raise ResearchPipelineError(
+                f"content {content_hash} references unknown questions: "
+                + ", ".join(sorted(unknown_question_ids))
+            )
+        source_observations = [
+            {
+                "research_id": document.research_id,
+                "provider": document.provider,
+                "source_name": document.source_name,
+                "provider_item_id": document.provider_item_id,
+                "headline": document.headline,
+                "symbols": list(document.symbols),
+                "question_ids": list(document.question_ids),
+                "raw_artifact_path": (
+                    f"research/{artifacts[document.research_id].relative_path}"
+                ),
+            }
+            for document in sorted(documents, key=lambda item: item.research_id)
+        ]
+        canonical_headline = (
+            canonical.headline
+            if len(source_observations) == 1
+            else (
+                f"Deduplicated identical {canonical.source_type.lower()} payload "
+                f"observed in {len(source_observations)} research contexts"
+            )
+        )
+        for question_id in question_order:
+            if question_id not in admitted_question_ids:
+                continue
+            question = question_by_id[question_id]
+            record = persist_research_item(
+                session,
+                research_id=database_id,
+                run_id=run_id,
+                symbols=symbols,
+                source_tier=canonical.source_tier,
+                source_type=canonical.source_type,
+                source_name=canonical.source_name,
+                provider=canonical.provider,
+                provider_item_id=canonical.provider_item_id,
+                research_question_id=question.question_id,
+                research_question=question.query,
+                raw_artifact_path=f"research/{artifact.relative_path}",
+                normalized_summary=canonical.summary or canonical_headline,
+                normalized_text=canonical.normalized_text,
+                published_at=canonical.published_at,
+                retrieved_at=canonical.retrieved_at,
+                content_hash=canonical.content_hash,
+                headline=canonical_headline,
+                url=canonical.url,
+                author=canonical.author,
+                metadata={
+                    **canonical.metadata,
+                    "collector_research_id": canonical.research_id,
+                    "source_observations": source_observations,
+                },
+                cost_usd=canonical.cost_usd,
+            )
+            if record.id not in seen_persisted:
+                persisted_ids.append(record.id)
+                seen_persisted.add(record.id)
+    return tuple(persisted_ids)
 
 
 def _unique_documents(collection: ResearchCollection) -> dict[str, ResearchDocument]:

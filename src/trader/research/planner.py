@@ -25,6 +25,77 @@ class ResearchPlanner:
             )
         )
 
+    def fast_plan(
+        self,
+        scan: UniverseScan,
+        *,
+        portfolio_symbols: tuple[str, ...] = (),
+        event_symbols: tuple[str, ...] = (),
+    ) -> ResearchPlan:
+        """Build the all-candidate market pass used before scarce deep slots are assigned."""
+
+        provisional = self.plan(
+            scan,
+            portfolio_symbols=portfolio_symbols,
+            event_symbols=event_symbols,
+        )
+        return provisional.model_copy(
+            update={
+                "deep_symbols": (),
+                "questions": tuple(
+                    question
+                    for question in provisional.questions
+                    if question.question_type == "MARKET_CONTEXT"
+                ),
+            }
+        )
+
+    def plan_with_deep_symbols(
+        self,
+        scan: UniverseScan,
+        *,
+        deep_symbols: tuple[str, ...],
+        portfolio_symbols: tuple[str, ...] = (),
+        event_symbols: tuple[str, ...] = (),
+    ) -> ResearchPlan:
+        """Finish the initial plan after the fast pass has screened deep candidates."""
+
+        fast = self.fast_plan(
+            scan,
+            portfolio_symbols=portfolio_symbols,
+            event_symbols=event_symbols,
+        )
+        if len(deep_symbols) > self.config.selection.max_deep_symbols:
+            raise ValueError("policy-aware deep selection exceeds its configured cap")
+        if not set(deep_symbols).issubset(set(fast.candidate_symbols)):
+            raise ValueError("policy-aware deep selection contains a non-candidate symbol")
+        priorities = {
+            question.symbol: question.priority for question in fast.questions
+        }
+        questions = list(fast.questions)
+        additional_types: tuple[QuestionType, ...] = ("COMPANY_NEWS", "SEC_FILINGS")
+        additional_count = self.config.selection.max_questions_per_symbol - 1
+        for symbol in deep_symbols:
+            for offset, question_type in enumerate(
+                additional_types[:additional_count], start=1
+            ):
+                if question_type == "SEC_FILINGS" and symbol not in self.sec_symbols:
+                    continue
+                questions.append(
+                    self._question(
+                        symbol=symbol,
+                        question_type=question_type,
+                        as_of=scan.as_of,
+                        priority=max(1, priorities[symbol] - offset),
+                    )
+                )
+        return ResearchPlan(
+            as_of=fast.as_of,
+            candidate_symbols=fast.candidate_symbols,
+            deep_symbols=deep_symbols,
+            questions=tuple(questions),
+        )
+
     def plan(
         self,
         scan: UniverseScan,
@@ -122,7 +193,14 @@ class ResearchPlanner:
         request_cost = {
             "MARKET_CONTEXT": 2,
             "COMPANY_NEWS": 1,
-            "SEC_FILINGS": 2 * sec_request_attempts,
+            "SEC_FILINGS": (
+                2 + (3 * self.config.collection.max_primary_filings_per_symbol)
+            )
+            * sec_request_attempts,
+            "SEC_FILING_HISTORY": (
+                1 + (3 * self.config.collection.max_primary_filings_per_symbol)
+            )
+            * sec_request_attempts,
         }
         estimated_requests = sum(request_cost[question.question_type] for question in questions)
         if estimated_requests > self.config.collection.max_total_requests:
@@ -208,8 +286,11 @@ class ResearchPlanner:
     ) -> ResearchQuestion:
         freshness = self.config.freshness
         if question_type == "MARKET_CONTEXT":
-            window_start = as_of - timedelta(hours=freshness.market_context_hours)
-            query = f"Current price, liquidity, volume, and market context for {symbol}"
+            window_start = as_of - timedelta(days=freshness.market_history_days)
+            query = (
+                f"Price and market context current within {freshness.market_context_hours} hours, "
+                f"plus {freshness.market_history_days}-day liquidity and volume for {symbol}"
+            )
         elif question_type == "COMPANY_NEWS":
             window_start = as_of - timedelta(days=freshness.company_news_days)
             query = f"Material company news and catalysts for {symbol}"

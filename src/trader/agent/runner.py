@@ -328,6 +328,10 @@ def daily_run(
                 directory / "research_plan.json",
                 research_result.plan.model_dump(mode="json"),
             )
+            _write_json(
+                directory / "research_deep_selection.json",
+                [item.model_dump(mode="json") for item in research_result.deep_selection],
+            )
             _write_json(directory / "research_summary.json", research_result.summary())
             event(
                 session,
@@ -339,6 +343,15 @@ def daily_run(
                     "http_request_count": research_result.total_request_count,
                     "unique_document_count": research_result.unique_document_count,
                     "persisted_research_ids": research_result.persisted_research_ids,
+                    "follow_up_requested_count": (
+                        research_result.follow_up_requested_count
+                    ),
+                    "follow_up_granted_count": (
+                        research_result.follow_up_granted_count
+                    ),
+                    "follow_up_new_document_count": (
+                        research_result.follow_up_new_document_count
+                    ),
                 },
             )
         else:

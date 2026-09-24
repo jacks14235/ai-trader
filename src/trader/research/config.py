@@ -33,14 +33,47 @@ class ResearchSelectionConfig(ResearchConfigModel):
         return self
 
 
+class ResearchFollowUpConfig(ResearchConfigModel):
+    """Human-owned limits for the single model-directed collection round."""
+
+    enabled: bool
+    max_rounds: Literal[1]
+    max_questions: int = Field(ge=1, le=8)
+    max_new_deep_symbols: int = Field(ge=0, le=2)
+    company_news_days: int = Field(ge=1, le=30)
+    sec_filing_history_days: int = Field(ge=91, le=730)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def actual_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("follow-up enabled must be a boolean")
+        return value
+
+    @field_validator(
+        "max_rounds",
+        "max_questions",
+        "max_new_deep_symbols",
+        "company_news_days",
+        "sec_filing_history_days",
+        mode="before",
+    )
+    @classmethod
+    def actual_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("follow-up research limits must be integers")
+        return value
+
+
 class ResearchCollectionConfig(ResearchConfigModel):
     max_items_per_symbol: int = Field(ge=1, le=100)
-    max_total_requests: int = Field(ge=1, le=200)
+    max_total_requests: int = Field(ge=1, le=500)
     max_total_items: int = Field(ge=1, le=1_000)
     max_response_bytes: int = Field(ge=1, le=MAX_RAW_DOCUMENT_BYTES)
     max_total_response_bytes: int = Field(ge=1, le=MAX_BATCH_BYTES)
     max_wall_clock_seconds: int = Field(ge=1, le=600)
     max_retries_per_request: int = Field(ge=0, le=3)
+    max_primary_filings_per_symbol: int = Field(ge=1, le=5)
 
     @field_validator("*", mode="before")
     @classmethod
@@ -60,6 +93,7 @@ class ResearchCollectionConfig(ResearchConfigModel):
 
 class ResearchFreshnessConfig(ResearchConfigModel):
     market_context_hours: int = Field(ge=1, le=72)
+    market_history_days: int = Field(ge=5, le=60)
     company_news_days: int = Field(ge=1, le=30)
     sec_filings_days: int = Field(ge=1, le=365)
 
@@ -104,6 +138,7 @@ class ResearchConfig(ResearchConfigModel):
     mode: Literal["shadow"]
     admitted_providers: tuple[ProviderName, ...]
     selection: ResearchSelectionConfig
+    follow_up: ResearchFollowUpConfig
     collection: ResearchCollectionConfig
     freshness: ResearchFreshnessConfig
     paid: PaidResearchConfig
@@ -133,7 +168,8 @@ class ResearchConfig(ResearchConfigModel):
             additional_request_count += 1
         if self.selection.max_questions_per_symbol == 3:
             sec_attempts = self.collection.max_retries_per_request + 1
-            additional_request_count += 2 * sec_attempts
+            sec_endpoints = 2 + (3 * self.collection.max_primary_filings_per_symbol)
+            additional_request_count += sec_endpoints * sec_attempts
         largest_plan = (2 * self.selection.max_fast_candidates) + (
             self.selection.max_deep_symbols * additional_request_count
         )

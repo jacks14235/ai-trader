@@ -1,9 +1,11 @@
 # Research Pipeline Design
 
-Status: Alpaca + SEC single-pass collection and daily-trader reasoning are implemented. The current
-[process-profile slice](process_profiles_plan.md) adds locally verified cited synthesis for simulated
-books only. Model-requested follow-up research and web/paid enrichment remain future work. The
-incumbent daily context and prompt remain unchanged.
+Status: Alpaca market/news collection, SEC filing indexes/company facts, bounded retention of actual
+primary filing documents, policy-aware deep-symbol promotion, and one model-directed follow-up round
+are implemented. The current [process-profile slice](process_profiles_plan.md) adds locally verified
+cited synthesis for simulated books. Web/paid enrichment remains future work. The daily-trader
+context and prompt remain unchanged; newly retained evidence enters through the existing evidence
+contract.
 
 ## Objective
 
@@ -20,13 +22,16 @@ candidate_scan.json (maximum 50 symbols)
 fast market/context pass for every candidate
         |
         v
-deterministic priority score + research planner
+deterministic price/liquidity/instrument screen + priority score
         |
         v
 deep research for a smaller set (default 8-12, holdings always eligible)
         |
         v
 normalized, deduplicated research items + immutable raw payloads
+        |
+        v
+bounded research-planner question -> one deterministic follow-up round
         |
         v
 symbol evidence packets containing facts, interpretations, conflicts, and evidence IDs
@@ -84,7 +89,9 @@ and admitted providers.
 1. Implemented: run-scoped `research_items`, symbols/questions, and model-evidence links plus migration.
 2. Implemented: strict research plan, question, document, batch, and policy models.
 3. Implemented: provider-neutral bounded collection and immutable raw artifact writing.
-4. Implemented: Alpaca market/news and official SEC ticker/submissions/company-facts providers.
+4. Implemented: Alpaca market/news and official SEC ticker/submissions/company-facts providers,
+   including bounded retrieval of actual primary documents for substantive forms and the first
+   issuer-authored `EX-99` exhibit attached to retained 8-K/6-K filings.
 5. Implemented: `trader research plan` read-only preview.
 6. Implemented: shadow collection inside `daily-run`; collection itself has no execution interface.
    Separately gated daily reasoning can produce proposals for deterministic risk and paper execution.
@@ -121,21 +128,22 @@ and measured process comparisons remain later slices.
 
 ### 2. Model-requested follow-up research
 
-A single deterministic pass cannot know which question matters until something has been read. Add a
-bounded second round:
+A single deterministic pass cannot know which question matters until something has been read. The
+implemented bounded second round is:
 
 1. Round one collects the current deterministic plan.
-2. A research-planner role reads the round-one packets and returns a validated `ResearchRequest`
-   list: symbol, question type, and the specific gap or contradiction being resolved.
+2. A read-only `research_planner` role reads the persisted first-round evidence and returns a
+   validated request list: symbol, question type, the specific gap, and its decision relevance.
 3. Deterministic code rejects any request naming an unsupported symbol, an unadmitted provider, an
    unknown question type, or a window outside the configured freshness policy. Surviving requests
    are truncated to the remaining request, byte, item, and wall-clock budget of the *same* run.
-4. Round two collects only the surviving requests. Its documents receive run-scoped evidence IDs
-   exactly like round one.
+4. Round two collects only the surviving requests. Current bounded choices expand company news,
+   promote a newly eligible symbol into current SEC filings, or retrieve a non-overlapping older SEC
+   filing window. Its documents receive run-scoped evidence IDs exactly like round one.
 
-The model chooses *what to ask*; configuration still decides what may be fetched and how much. The first
-implementation must set an exact maximum of two collection rounds so the loop always terminates. Budgets must be accounted
-cumulatively across rounds, which the current single-pass validators do not do.
+The model chooses *what to ask*; configuration still decides what may be fetched and how much. The
+configuration fixes the follow-up maximum at one round, and request, document, byte, paid-source, and
+wall-clock budgets are accounted cumulatively. The planner has no broker or execution interface.
 
 ### 3. New providers behind the same contract
 

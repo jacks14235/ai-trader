@@ -229,8 +229,8 @@ unknown, not proof of source omission.
       unavailability, and failed evaluation.
 - [x] Require relevant new inputs, a satisfied price trigger, or a due review before reopening an
       unchanged book idea. Named events remain unresolved until typed event context exists.
-- [ ] Add typed, bounded model-requested follow-up collection; profile steps currently summarize
-      the existing research bundle. See [research design](research_pipeline_design.md).
+- [x] Add one typed, bounded model-requested follow-up collection round with cumulative budgets and
+      deterministic provider/symbol/question validation. See [research design](research_pipeline_design.md).
 - [ ] Add pre-outcome predictions and independent resolution procedures.
 - [ ] Evaluate trade and wait decisions, inference costs, and process variants in controlled forward
       trials; hold starting conditions/configuration fixed and retain failed experiments.

@@ -25,6 +25,7 @@ from trader.research.collection import (
 )
 from trader.research.models import QuestionType, ResearchRequest
 from trader.research.sec import (
+    SEC_ARCHIVE_DOCUMENT_URL,
     SEC_COMPANY_TICKERS_URL,
     SEC_COMPANYFACTS_URL,
     SEC_SUBMISSIONS_URL,
@@ -251,6 +252,14 @@ def test_sec_uses_fixed_endpoints_user_agent_and_exact_payloads() -> None:
         assert request.headers["user-agent"] == "AI Trader test test@example.com"
         if "/submissions/" in str(request.url):
             return httpx.Response(200, json=_submissions())
+        if "/Archives/edgar/" in str(request.url):
+            return httpx.Response(
+                200,
+                content=(
+                    b"<html><body><h1>Quarterly report</h1>"
+                    b"<p>Revenue improved.</p></body></html>"
+                ),
+            )
         return httpx.Response(200, json=_companyfacts())
 
     provider = SecResearchProvider(
@@ -264,10 +273,15 @@ def test_sec_uses_fixed_endpoints_user_agent_and_exact_payloads() -> None:
     assert [str(call.url) for call in calls] == [
         SEC_SUBMISSIONS_URL.format(cik="0000320193"),
         SEC_COMPANYFACTS_URL.format(cik="0000320193"),
+        SEC_ARCHIVE_DOCUMENT_URL.format(
+            cik="320193",
+            accession="000032019326000001",
+            document="aapl-20260630.htm",
+        ),
     ]
     assert batch.provider == "sec"
-    assert batch.request_count == 2
-    assert len(batch.documents) == 2
+    assert batch.request_count == 3
+    assert len(batch.documents) == 3
     submissions = next(
         document for document in batch.documents if document.metadata["endpoint"] == "submissions"
     )
@@ -278,12 +292,21 @@ def test_sec_uses_fixed_endpoints_user_agent_and_exact_payloads() -> None:
         "8-K",
     ]
     assert all(document.source_tier == "PRIMARY" for document in batch.documents)
+    filing = next(
+        document
+        for document in batch.documents
+        if document.metadata["endpoint"] == "primary_filing_document"
+    )
+    assert "Revenue improved." in filing.normalized_text
+    assert filing.metadata["form"] == "10-Q"
 
 
 def test_sec_retains_submissions_when_companyfacts_is_not_available() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if "/submissions/" in str(request.url):
             return httpx.Response(200, json=_submissions())
+        if "/Archives/edgar/" in str(request.url):
+            return httpx.Response(200, content=b"<p>Quarterly report text.</p>")
         return httpx.Response(404, json={"message": "not found"})
 
     provider = SecResearchProvider(
@@ -294,11 +317,13 @@ def test_sec_retains_submissions_when_companyfacts_is_not_available() -> None:
 
     batch = provider.collect(_request("SEC_FILINGS"), retrieved_at=RETRIEVED)
 
-    assert batch.request_count == 2
-    assert len(batch.documents) == 1
-    assert batch.documents[0].metadata["endpoint"] == "submissions"
-    assert batch.documents[0].metadata["companyfacts_available"] is False
-    assert "HTTP 404" in str(batch.documents[0].metadata["companyfacts_error"])
+    assert batch.request_count == 3
+    assert len(batch.documents) == 2
+    submissions = next(
+        document for document in batch.documents if document.metadata["endpoint"] == "submissions"
+    )
+    assert submissions.metadata["companyfacts_available"] is False
+    assert "HTTP 404" in str(submissions.metadata["companyfacts_error"])
 
 
 def test_sec_retries_only_bounded_transient_failures() -> None:
@@ -312,6 +337,8 @@ def test_sec_retries_only_bounded_transient_failures() -> None:
             return httpx.Response(503, json={"error": "busy"})
         if "/submissions/" in str(request.url):
             return httpx.Response(200, json=_submissions())
+        if "/Archives/edgar/" in str(request.url):
+            return httpx.Response(200, content=b"<p>Quarterly report text.</p>")
         return httpx.Response(200, json=_companyfacts())
 
     provider = SecResearchProvider(
@@ -322,9 +349,109 @@ def test_sec_retries_only_bounded_transient_failures() -> None:
         sleep=sleeps.append,
     )
     batch = provider.collect(_request("SEC_FILINGS"), retrieved_at=RETRIEVED)
-    assert batch.request_count == 3
-    assert calls == 3
+    assert batch.request_count == 4
+    assert calls == 4
     assert sleeps == [0.25]
+
+
+def test_sec_history_fetches_older_primary_document_without_repeating_companyfacts() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if "/submissions/" in str(request.url):
+            return httpx.Response(200, json=_submissions())
+        if str(request.url).endswith("-index.html"):
+            return httpx.Response(200, content=b"<html><table></table></html>")
+        if str(request.url).endswith("aapl-8k.htm"):
+            return httpx.Response(200, content=b"<p>Earlier material event disclosure.</p>")
+        raise AssertionError(f"unexpected SEC request: {request.url}")
+
+    request = ResearchRequest.create(
+        symbol="AAPL",
+        question_type="SEC_FILING_HISTORY",
+        query="Retrieve an older operating baseline for AAPL",
+        window_start=datetime(2026, 6, 1, tzinfo=UTC),
+        window_end=datetime(2026, 8, 1, tzinfo=UTC),
+        priority=80,
+    )
+    provider = SecResearchProvider(
+        user_agent="AI Trader test test@example.com",
+        symbol_to_cik={"AAPL": 320193},
+        max_primary_documents=1,
+        client=_sec_client(handler),
+    )
+
+    batch = provider.collect(request, retrieved_at=RETRIEVED)
+
+    assert len(calls) == 3
+    assert all("companyfacts" not in str(call.url) for call in calls)
+    filing = next(
+        document
+        for document in batch.documents
+        if document.metadata["endpoint"] == "primary_filing_document"
+    )
+    assert filing.metadata["form"] == "8-K"
+    assert filing.metadata["historical_follow_up"] is True
+    assert "Earlier material event disclosure." in filing.normalized_text
+
+
+def test_sec_retains_issuer_authored_ex99_release_from_fixed_archive_path() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        calls.append(url)
+        if "/submissions/" in url:
+            return httpx.Response(200, json=_submissions())
+        if "/companyfacts/" in url:
+            return httpx.Response(200, json=_companyfacts())
+        if url.endswith("aapl-8k.htm"):
+            return httpx.Response(200, content=b"<p>Item 2.02 results furnished.</p>")
+        if url.endswith("-index.html"):
+            return httpx.Response(
+                200,
+                content=(
+                    b'<table><tr><td>2</td><td><a href="/Archives/edgar/data/'
+                    b'320193/000032019326000002/aapl-ex991.htm">aapl-ex991.htm</a>'
+                    b"</td><td>EX-99.1</td></tr></table>"
+                ),
+            )
+        if url.endswith("aapl-ex991.htm"):
+            return httpx.Response(
+                200,
+                content=b"<h1>Quarterly Results</h1><p>Revenue and guidance improved.</p>",
+            )
+        raise AssertionError(f"unexpected SEC request: {url}")
+
+    request = ResearchRequest.create(
+        symbol="AAPL",
+        question_type="SEC_FILINGS",
+        query="Retrieve AAPL's material issuer release",
+        window_start=datetime(2026, 6, 1, tzinfo=UTC),
+        window_end=datetime(2026, 8, 1, tzinfo=UTC),
+        priority=80,
+    )
+    provider = SecResearchProvider(
+        user_agent="AI Trader test test@example.com",
+        symbol_to_cik={"AAPL": 320193},
+        max_primary_documents=1,
+        client=_sec_client(handler),
+    )
+
+    batch = provider.collect(request, retrieved_at=RETRIEVED)
+
+    assert batch.request_count == 5
+    exhibit = next(
+        document
+        for document in batch.documents
+        if document.metadata["endpoint"] == "issuer_filing_exhibit"
+    )
+    assert exhibit.metadata["exhibit_type"] == "EX-99.1"
+    assert "Revenue and guidance improved." in exhibit.normalized_text
+    assert exhibit.url is not None
+    assert exhibit.url.startswith("https://www.sec.gov/Archives/edgar/data/320193/")
+    assert all(url.startswith(("https://data.sec.gov/", "https://www.sec.gov/")) for url in calls)
 
 
 def test_sec_rejects_missing_mapping_bad_schema_status_and_oversize() -> None:

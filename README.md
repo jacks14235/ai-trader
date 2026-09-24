@@ -53,10 +53,14 @@ proposal or order, and options/crypto are outside this first universe implementa
 
 ## Shadow research collection
 
-The candidate slate now feeds a bounded, deterministic research plan. Every candidate receives an
-Alpaca market-context question; up to ten priority symbols receive Alpaca company news; and symbols
-with an official SEC ticker-to-CIK mapping also receive SEC submissions and company-facts research.
-ETFs and other unmapped instruments simply omit the SEC question rather than failing the run.
+The candidate slate now feeds a bounded research plan. Every candidate first receives Alpaca market
+context. Current price, 20-day dollar volume, and deterministic leveraged/inverse-fund checks then
+decide which policy-compatible names receive scarce deep slots; holdings and event symbols remain
+pinned so the portfolio can always research an exit. Deep names receive Alpaca company news and,
+when mapped to an official SEC CIK, submissions, company facts, and a bounded number of actual filing
+documents. For 8-K/6-K filings, the same fixed SEC archive path also retains the first issuer-authored
+`EX-99` release when present. ETFs and other unmapped instruments omit SEC questions rather than
+failing the run.
 
 Set an SEC-compliant identity in `.env` before using this pipeline:
 
@@ -70,7 +74,10 @@ Preview the exact questions without persisting evidence:
 uv run trader research plan
 ```
 
-`daily-run` performs the collection in shadow mode. It retains the exact official SEC ticker map,
+`daily-run` performs the collection in shadow mode. When reasoning is enabled, a read-only research
+planner may request one bounded follow-up round for expanded company news, current SEC filings on a
+newly promoted name, or a non-overlapping older SEC filing window. It cannot browse or trade, and the
+same cumulative request, byte, item, time, and provider caps apply. The run retains the SEC ticker map,
 its canonical normalized form, every raw provider payload, `research_plan.json`, and
 `research_summary.json`. Research rows are scoped to the run, deduplicated by content within that run,
 and linked to every question they answered. Network calls, response bytes, item counts, retries,

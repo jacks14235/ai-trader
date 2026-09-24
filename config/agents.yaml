@@ -16,6 +16,21 @@ model_profiles:
     reasoning_effort: high
 
 roles:
+  research_planner:
+    enabled: true
+    profile: fast
+    prompt: prompts/research_planner.md
+    context_sources: [candidate_overview, deep_research]
+    max_context_chars: 160000
+    max_document_chars: 5000
+    max_output_chars: 20000
+    timeout_seconds: 120
+    permissions:
+      filesystem: read-only
+      web_search: false
+      can_submit_orders: false
+      can_mutate_knowledge: false
+
   research_compactor:
     enabled: true
     profile: fast

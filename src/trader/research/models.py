@@ -23,6 +23,7 @@ type QuestionType = Literal[
     "MARKET_CONTEXT",
     "COMPANY_NEWS",
     "SEC_FILINGS",
+    "SEC_FILING_HISTORY",
 ]
 type SourceType = Literal["MARKET_DATA", "NEWS", "REGULATORY_FILING"]
 type SourceTier = Literal["BROKER", "PRIMARY"]

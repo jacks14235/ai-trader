@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from datetime import time as datetime_time
 from decimal import Decimal
+from html.parser import HTMLParser
 from types import MappingProxyType
 from typing import Literal, cast
 
@@ -27,10 +29,19 @@ from trader.research.models import (
 
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+SEC_ARCHIVE_DOCUMENT_URL = (
+    "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
+)
+SEC_FILING_INDEX_URL = (
+    "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{accession_hyphenated}-index.html"
+)
 SEC_COMPANY_TICKERS_URL: Literal[
     "https://www.sec.gov/files/company_tickers.json"
 ] = "https://www.sec.gov/files/company_tickers.json"
 _TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
+_SUBSTANTIVE_FORMS = frozenset({"10-K", "10-Q", "8-K", "20-F", "40-F", "6-K"})
+_ACCESSION_PATTERN = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
+_DOCUMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
 class SecResearchError(RuntimeError):
@@ -142,7 +153,9 @@ class SecResearchProvider:
     """
 
     provider_name: ProviderName = "sec"
-    supported_question_types: frozenset[QuestionType] = frozenset({"SEC_FILINGS"})
+    supported_question_types: frozenset[QuestionType] = frozenset(
+        {"SEC_FILINGS", "SEC_FILING_HISTORY"}
+    )
 
     def __init__(
         self,
@@ -153,6 +166,7 @@ class SecResearchProvider:
         max_response_bytes: int = 5_000_000,
         max_attempts: int = 2,
         max_filings: int = 40,
+        max_primary_documents: int = 2,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -165,6 +179,8 @@ class SecResearchProvider:
             raise ValueError("SEC max_attempts must be between 1 and 5")
         if not 1 <= max_filings <= 100:
             raise ValueError("SEC max_filings must be between 1 and 100")
+        if not 1 <= max_primary_documents <= 5:
+            raise ValueError("SEC max_primary_documents must be between 1 and 5")
         self.user_agent = normalized_user_agent
         self.symbol_to_cik = _normalize_cik_mapping(symbol_to_cik)
         if not self.symbol_to_cik:
@@ -173,13 +189,19 @@ class SecResearchProvider:
         self.max_response_bytes = max_response_bytes
         self.max_attempts = max_attempts
         self.max_filings = max_filings
+        self.max_primary_documents = max_primary_documents
         self.client = client or httpx.Client()
         self.sleep = sleep
 
     def estimated_request_count(self, request: ResearchRequest) -> int:
-        if request.question_type != "SEC_FILINGS":
+        if request.question_type not in self.supported_question_types:
             raise SecResearchError(f"SEC research does not support {request.question_type}")
-        return 2 * self.max_attempts
+        # Every retained primary document may be an 8-K/6-K whose issuer-authored
+        # EX-99 release requires one index request and one exhibit request.
+        endpoint_count = 1 + (3 * self.max_primary_documents)
+        if request.question_type == "SEC_FILINGS":
+            endpoint_count += 1
+        return endpoint_count * self.max_attempts
 
     def collect(
         self,
@@ -187,7 +209,7 @@ class SecResearchProvider:
         *,
         retrieved_at: datetime | None = None,
     ) -> ResearchBatch:
-        if request.question_type != "SEC_FILINGS":
+        if request.question_type not in self.supported_question_types:
             raise SecResearchError(f"SEC research does not support {request.question_type}")
         cik = self.symbol_to_cik.get(request.symbol)
         if cik is None:
@@ -195,17 +217,19 @@ class SecResearchProvider:
                 f"no deterministic SEC CIK mapping configured for {request.symbol}"
             )
         submissions_url = SEC_SUBMISSIONS_URL.format(cik=cik)
-        facts_url = SEC_COMPANYFACTS_URL.format(cik=cik)
         submissions_bytes, submissions_attempts = self._fetch(submissions_url)
+        facts_url = SEC_COMPANYFACTS_URL.format(cik=cik)
+        facts_bytes: bytes | None = None
+        facts_attempts = 0
         facts_error: str | None = None
-        try:
-            facts_bytes, facts_attempts = self._fetch(facts_url)
-        except SecHttpStatusError as exc:
-            if exc.status_code != 404:
-                raise
-            facts_bytes = None
-            facts_attempts = 1
-            facts_error = str(exc)
+        if request.question_type == "SEC_FILINGS":
+            try:
+                facts_bytes, facts_attempts = self._fetch(facts_url)
+            except SecHttpStatusError as exc:
+                if exc.status_code != 404:
+                    raise
+                facts_attempts = 1
+                facts_error = str(exc)
         retrieved = _retrieval_time(retrieved_at)
         submissions = _load_object(submissions_bytes, "SEC submissions")
 
@@ -215,6 +239,11 @@ class SecResearchProvider:
             window_start=request.window_start,
             window_end=request.window_end,
             max_filings=self.max_filings,
+        )
+        selected_rows = _select_primary_filing_rows(
+            recent_rows,
+            limit=self.max_primary_documents,
+            historical=request.question_type == "SEC_FILING_HISTORY",
         )
         published_at = _latest_submission_timestamp(recent_rows, retrieved)
         common_metadata: dict[str, JsonValue] = {
@@ -245,6 +274,7 @@ class SecResearchProvider:
                 "endpoint": "submissions",
                 "entity_name": entity_name,
                 "filing_count_in_window": len(recent_rows),
+                "retained_primary_document_count": len(selected_rows),
                 "companyfacts_available": facts_bytes is not None,
                 "companyfacts_error": facts_error,
                 "forms": cast(
@@ -294,13 +324,113 @@ class SecResearchProvider:
                     cost_usd=Decimal("0"),
                 )
             )
+        filing_attempts = 0
+        filing_response_bytes = 0
+        for row in selected_rows:
+            url = _primary_document_url(cik, row)
+            payload, attempts = self._fetch(url)
+            filing_attempts += attempts
+            filing_response_bytes += len(payload)
+            accession = str(row["accessionNumber"])
+            form = str(row["form"])
+            accepted = _sec_datetime(
+                str(row["acceptanceDateTime"]), "acceptanceDateTime"
+            )
+            if accepted > retrieved:
+                raise SecResearchError("SEC filing acceptance time is after retrieval")
+            document_name = str(row["primaryDocument"])
+            documents.append(
+                ResearchDocument.create(
+                    question_ids=(request.question_id,),
+                    provider="sec",
+                    source_type="REGULATORY_FILING",
+                    source_tier="PRIMARY",
+                    source_name="SEC EDGAR primary filing document",
+                    provider_item_id=f"filing:{accession}:{document_name}",
+                    url=url,
+                    author=None,
+                    published_at=accepted,
+                    retrieved_at=retrieved,
+                    symbols=(request.symbol,),
+                    headline=f"{entity_name} {form} filed {row['filingDate']}",
+                    normalized_text=_normalized_filing_text(payload),
+                    summary=None,
+                    raw_payload=payload,
+                    metadata={
+                        **common_metadata,
+                        "endpoint": "primary_filing_document",
+                        "entity_name": entity_name,
+                        "accession_number": accession,
+                        "form": form,
+                        "filing_date": str(row["filingDate"]),
+                        "report_date": str(row["reportDate"]),
+                        "primary_document": document_name,
+                        "historical_follow_up": (
+                            request.question_type == "SEC_FILING_HISTORY"
+                        ),
+                    },
+                    cost_usd=Decimal("0"),
+                )
+            )
+            if form in {"8-K", "6-K"}:
+                index_url = _filing_index_url(cik, accession)
+                index_payload, index_attempts = self._fetch(index_url)
+                filing_attempts += index_attempts
+                filing_response_bytes += len(index_payload)
+                exhibit = _issuer_exhibit_reference(index_payload)
+                if exhibit is not None:
+                    exhibit_type, exhibit_name = exhibit
+                    exhibit_url = _archive_document_url(cik, accession, exhibit_name)
+                    exhibit_payload, exhibit_attempts = self._fetch(exhibit_url)
+                    filing_attempts += exhibit_attempts
+                    filing_response_bytes += len(exhibit_payload)
+                    documents.append(
+                        ResearchDocument.create(
+                            question_ids=(request.question_id,),
+                            provider="sec",
+                            source_type="REGULATORY_FILING",
+                            source_tier="PRIMARY",
+                            source_name="SEC EDGAR issuer exhibit",
+                            provider_item_id=(
+                                f"exhibit:{accession}:{exhibit_type}:{exhibit_name}"
+                            ),
+                            url=exhibit_url,
+                            author=None,
+                            published_at=accepted,
+                            retrieved_at=retrieved,
+                            symbols=(request.symbol,),
+                            headline=(
+                                f"{entity_name} {exhibit_type} issuer exhibit filed "
+                                f"{row['filingDate']}"
+                            ),
+                            normalized_text=_normalized_filing_text(exhibit_payload),
+                            summary=None,
+                            raw_payload=exhibit_payload,
+                            metadata={
+                                **common_metadata,
+                                "endpoint": "issuer_filing_exhibit",
+                                "entity_name": entity_name,
+                                "accession_number": accession,
+                                "parent_form": form,
+                                "exhibit_type": exhibit_type,
+                                "filing_date": str(row["filingDate"]),
+                                "document": exhibit_name,
+                                "historical_follow_up": (
+                                    request.question_type == "SEC_FILING_HISTORY"
+                                ),
+                            },
+                            cost_usd=Decimal("0"),
+                        )
+                    )
         return ResearchBatch(
             provider="sec",
             retrieved_at=retrieved,
             question_ids=(request.question_id,),
             documents=tuple(documents),
-            request_count=submissions_attempts + facts_attempts,
-            response_bytes=len(submissions_bytes) + len(facts_bytes or b""),
+            request_count=submissions_attempts + facts_attempts + filing_attempts,
+            response_bytes=(
+                len(submissions_bytes) + len(facts_bytes or b"") + filing_response_bytes
+            ),
             cost_usd=Decimal("0"),
         )
 
@@ -339,7 +469,7 @@ def _fetch_sec_payload(
 ) -> tuple[bytes, int]:
     headers = {
         "User-Agent": user_agent,
-        "Accept": "application/json",
+        "Accept": "application/json,text/html,application/xhtml+xml",
         "Accept-Encoding": "gzip, deflate",
     }
     last_error: str | None = None
@@ -523,6 +653,167 @@ def _validate_submissions(
             if len(rows) >= max_filings:
                 break
     return rows, name.strip()
+
+
+def _select_primary_filing_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    limit: int,
+    historical: bool,
+) -> tuple[Mapping[str, object], ...]:
+    """Choose a bounded set of substantive filings from SEC's newest-first list.
+
+    History requests use a non-overlapping older time window, so both modes retain the
+    newest substantive documents inside their own admitted window.
+    """
+
+    substantive = [row for row in rows if str(row.get("form")) in _SUBSTANTIVE_FORMS]
+    del historical
+    return tuple(substantive[:limit])
+
+
+def _primary_document_url(cik: str, row: Mapping[str, object]) -> str:
+    accession = str(row.get("accessionNumber", ""))
+    document = str(row.get("primaryDocument", ""))
+    if not _ACCESSION_PATTERN.fullmatch(accession):
+        raise SecResearchError("SEC filing contains an invalid accession number")
+    if not _DOCUMENT_PATTERN.fullmatch(document):
+        raise SecResearchError("SEC filing contains an unsafe primary document name")
+    return _archive_document_url(cik, accession, document)
+
+
+def _archive_document_url(cik: str, accession: str, document: str) -> str:
+    if not _ACCESSION_PATTERN.fullmatch(accession):
+        raise SecResearchError("SEC filing contains an invalid accession number")
+    if not _DOCUMENT_PATTERN.fullmatch(document):
+        raise SecResearchError("SEC filing contains an unsafe document name")
+    return SEC_ARCHIVE_DOCUMENT_URL.format(
+        cik=str(int(cik)),
+        accession=accession.replace("-", ""),
+        document=document,
+    )
+
+
+def _filing_index_url(cik: str, accession: str) -> str:
+    if not _ACCESSION_PATTERN.fullmatch(accession):
+        raise SecResearchError("SEC filing contains an invalid accession number")
+    return SEC_FILING_INDEX_URL.format(
+        cik=str(int(cik)),
+        accession=accession.replace("-", ""),
+        accession_hyphenated=accession,
+    )
+
+
+class _FilingIndexExtractor(HTMLParser):
+    """Extract the first issuer exhibit from the SEC filing-detail table."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._in_row = False
+        self._parts: list[str] = []
+        self._links: list[str] = []
+        self.rows: list[tuple[str, tuple[str, ...]]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag.lower() == "tr":
+            self._in_row = True
+            self._parts = []
+            self._links = []
+        if tag.lower() == "a" and self._in_row:
+            href = next((value for name, value in attrs if name.lower() == "href"), None)
+            if href is not None:
+                self._links.append(href)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "tr" and self._in_row:
+            self.rows.append((" ".join(self._parts), tuple(self._links)))
+            self._in_row = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_row:
+            text = " ".join(data.split())
+            if text:
+                self._parts.append(text)
+
+
+def _issuer_exhibit_reference(payload: bytes) -> tuple[str, str] | None:
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = payload.decode("latin-1")
+    parser = _FilingIndexExtractor()
+    try:
+        parser.feed(decoded)
+        parser.close()
+    except Exception as exc:
+        raise SecResearchError(f"SEC filing index contains invalid HTML: {exc}") from exc
+    for text, links in parser.rows:
+        match = re.search(r"\bEX-99(?:\.[0-9]+)?\b", text, re.IGNORECASE)
+        if match is None:
+            continue
+        for href in links:
+            document = href.rsplit("/", 1)[-1]
+            if _DOCUMENT_PATTERN.fullmatch(document):
+                return match.group(0).upper(), document
+        raise SecResearchError("SEC issuer exhibit row contains no safe document link")
+    return None
+
+
+class _FilingTextExtractor(HTMLParser):
+    """Small deterministic HTML-to-text projection; exact source bytes remain retained."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        del attrs
+        if tag.lower() in {"script", "style", "noscript", "ix:hidden"}:
+            self._ignored_depth += 1
+        elif tag.lower() in {"td", "th"}:
+            self.parts.append("\t")
+        elif tag.lower() in {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript", "ix:hidden"}:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+        elif tag.lower() in {"td", "th"}:
+            self.parts.append("\t")
+        elif tag.lower() in {"p", "div", "tr", "li", "h1", "h2", "h3", "h4"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth == 0:
+            self.parts.append(data)
+
+
+def _normalized_filing_text(payload: bytes, *, max_chars: int = 500_000) -> str:
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = payload.decode("latin-1")
+    extractor = _FilingTextExtractor()
+    try:
+        extractor.feed(decoded)
+        extractor.close()
+    except Exception as exc:
+        raise SecResearchError(f"SEC primary filing contains invalid HTML: {exc}") from exc
+    text = "\n".join(
+        line for line in (" ".join(part.split()) for part in extractor.parts) if line
+    ).strip()
+    if not text:
+        text = " ".join(decoded.split()).strip()
+    if not text:
+        raise SecResearchError("SEC primary filing document contains no readable text")
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n[normalized text truncated; exact payload retained]"
 
 
 def _validate_companyfacts(

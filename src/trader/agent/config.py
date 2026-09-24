@@ -7,6 +7,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 RoleName = Literal[
+    "research_planner",
     "research_compactor",
     "daily_trader",
     "event_trader",
@@ -29,7 +30,13 @@ ContextSource = Literal[
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 REQUIRED_ROLES: frozenset[str] = frozenset(
-    {"research_compactor", "daily_trader", "event_trader", "weekly_strategist"}
+    {
+        "research_planner",
+        "research_compactor",
+        "daily_trader",
+        "event_trader",
+        "weekly_strategist",
+    }
 )
 
 
@@ -145,6 +152,13 @@ class AgentConfig(AgentConfigModel):
                 }
                 if not required.issubset(role.context_sources):
                     raise ValueError("daily_trader is missing a required context source")
+            if role_name == "research_planner" and set(role.context_sources) != {
+                "candidate_overview",
+                "deep_research",
+            }:
+                raise ValueError(
+                    "research_planner requires exactly candidate_overview and deep_research"
+                )
         if self.automatic_daily_run and not self.roles["daily_trader"].enabled:
             raise ValueError("automatic daily reasoning requires the daily_trader role")
         return self

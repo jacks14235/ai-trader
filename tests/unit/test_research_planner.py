@@ -36,17 +36,27 @@ def config_dict() -> dict[str, object]:
             "max_deep_symbols": 8,
             "max_questions_per_symbol": 3,
         },
+        "follow_up": {
+            "enabled": True,
+            "max_rounds": 1,
+            "max_questions": 4,
+            "max_new_deep_symbols": 2,
+            "company_news_days": 30,
+            "sec_filing_history_days": 365,
+        },
         "collection": {
             "max_items_per_symbol": 10,
-            "max_total_requests": 90,
+            "max_total_requests": 260,
             "max_total_items": 50,
             "max_response_bytes": 1_000_000,
             "max_total_response_bytes": 5_000_000,
             "max_wall_clock_seconds": 60,
             "max_retries_per_request": 2,
+            "max_primary_filings_per_symbol": 2,
         },
         "freshness": {
             "market_context_hours": 24,
+            "market_history_days": 20,
             "company_news_days": 7,
             "sec_filings_days": 90,
         },
@@ -108,7 +118,7 @@ def test_repository_research_policy_loads_with_bounded_shadow_defaults() -> None
     assert set(policy.admitted_providers) == {"alpaca", "sec"}
     assert policy.selection.max_fast_candidates == 50
     assert policy.selection.max_deep_symbols == 10
-    assert policy.collection.max_total_requests == 180
+    assert policy.collection.max_total_requests == 320
     assert policy.paid.max_per_run_usd == 0
 
 

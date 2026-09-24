@@ -57,7 +57,7 @@ Package map:
 - `settings.py` — pydantic-settings from `.env`
 - `broker/` — `Broker` protocol and Alpaca paper adapter
 - `universe/` — broad Alpaca catalog → bounded candidate slate (cap 50)
-- `research/` — deterministic plan + bounded Alpaca/SEC collection; no execution access
+- `research/` — staged, bounded Alpaca/SEC collection and policy-aware deep selection; no execution access
 - `scheduling/` — durable event runs in SQLite (not cron/Codex schedules)
 - `agent/` — context assembly, Codex CLI boundary, role-agnostic invocation, daily/event runners
 - `ledger/` — deterministic decision-quality record: theses, performance, report rows; no broker
@@ -82,32 +82,39 @@ Typical stages (append-only `run_events`):
 5. Close active theses whose symbol is no longer held (safe only because open orders were refused)
 6. Scan universe → `eligible_assets.json` + `candidate_scan.json`
 7. Discover BEA (or file) events and schedule policy-approved follow-ups
-8. Collect bounded Alpaca/SEC research (shadow)
-9. Optionally invoke daily trader for structured proposals
-10. Optionally evaluate every proposal in the risk engine, then submit approved paper orders
-11. Optionally evaluate each active simulated book against the same slate and research
+8. Collect the fast market pass, policy-screen deep symbols, then collect bounded Alpaca/SEC research
+9. Optionally invoke the read-only research planner for one budget-sharing follow-up round
+10. Optionally invoke daily trader for structured proposals
+11. Optionally evaluate every proposal in the risk engine, then submit approved paper orders
+12. Optionally evaluate each active simulated book against the same slate and research
  (isolated; a book failure cannot abort the live run and never submits)
-12. Record the decision ledger from risk-approved **live** proposals → `ledger_summary.json`
-13. Record the performance snapshot for the run
-14. Render `daily_update.html` from the daily trader's briefing plus post-trade facts, then write
+13. Record the decision ledger from risk-approved **live** proposals → `ledger_summary.json`
+14. Record the performance snapshot for the run
+15. Render `daily_update.html` from the daily trader's briefing plus post-trade facts, then write
  `daily_report.md`, its `daily_reports` row, and a SHA-256 `manifest.json`
 
 Candidate slate is **not** the full catalog. It pins holdings and SPY/QQQ, then merges most-active
 volume/trades, top gainers/losers, and a date-stable exploration sample. Preview with
 `trader universe scan` / `trader research plan` (no DB writes).
 
-Research: every candidate gets `MARKET_CONTEXT`; up to `max_deep_symbols` (default 10, holdings
-pinned) also get `COMPANY_NEWS` and, if ticker→CIK mapped, `SEC_FILINGS`. Unmapped ETFs omit SEC
-rather than failing. Paid providers are disabled with a $0 budget. Evidence IDs are
+Research: every candidate gets `MARKET_CONTEXT`; the fast result screens price, dollar volume, and
+leveraged/inverse product names before up to `max_deep_symbols` (default 10, holdings/events pinned)
+receive `COMPANY_NEWS` and, if ticker→CIK mapped, `SEC_FILINGS` with retained primary-document text.
+An 8-K/6-K also retains the first issuer-authored `EX-99` exhibit found in its official SEC filing
+index.
+One typed planner call may request expanded news, promote another policy-compatible candidate, or
+retrieve an older non-overlapping SEC window. Unmapped ETFs omit SEC rather than failing. Paid
+providers are disabled with a $0 budget. Evidence IDs are
 `sha256(run_id + NUL + content_hash)` (64 hex chars), run-scoped, and must be cited exactly.
 
 ## In-app reasoning
 
-`config/agents.yaml` registers four roles. Permissions: filesystem read-only, web search off,
+`config/agents.yaml` registers five roles. Permissions: filesystem read-only, web search off,
 orders off. Only weekly strategist may set `can_mutate_knowledge`.
 
 | Role | Status |
 | --- | --- |
+| `research_planner` | Wired; one bounded follow-up round when reasoning is enabled |
 | `research_compactor` | Wired for simulated-book process profiles only |
 | `daily_trader` | Wired; gated by `TRADER_REASONING_ENABLED` + `automatic_daily_run` |
 | `event_trader` | Configured; event runs currently record `NO_ACTION` |
@@ -392,7 +399,7 @@ content are assessed deterministically, and a manager reopening that wait must c
 machine-observed change. Each book also receives model-free flat-cash and one-time SPY buy-and-hold
 reference points; these are comparison curves, not agent books.
 
-Not yet: model-requested follow-up research, event-trader invocation, web/paid providers, CEO book
+Not yet: event-trader invocation, web/paid providers, CEO book
 proposals, automatic promotion or demotion of a book, or scored weekly review of book equity curves.
 See
 `docs/research_pipeline_design.md` before expanding research and `docs/remaining_work.md` for the
@@ -400,9 +407,9 @@ deployment and launch checklist.
 
 Structural gaps that block multi-agent work, in rough dependency order:
 
-- Research collection is single-pass and fully deterministic; there is no validated object through
-  which a model may request follow-up research. This is the last blocker for a compactor that does
-  more than summarize, and for an event trader that can ask a question before deciding.
+- Follow-up research is currently limited to Alpaca news and SEC primary documents. Independent web,
+  industry, and event-specific sources still need admitted provider contracts before a planner can
+  resolve gaps those two providers cannot answer.
 - The event trader still has no context assembler, so `event-run` records `NO_ACTION`. The
   invocation primitive and the context-source verifier are both role-agnostic now, so this needs an
   `EventAgentContext` and an `EVENT_CONTEXT_SOURCES` map rather than new machinery.
