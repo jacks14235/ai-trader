@@ -1,6 +1,6 @@
 # Paper Trader: Remaining Work and Raspberry Pi Handoff
 
-Last updated: 2026-09-19
+Last updated: 2026-09-20
 
 This document tracks the work remaining after the initial Raspberry Pi deployment. The Pi is reported to be running the trader, but its service definitions and installation procedure are not currently stored in this repository. Some verification items below may already be complete on the Pi; in that case, the remaining task is to record the configuration and evidence so the deployment is reproducible.
 
@@ -207,6 +207,9 @@ Every provider should preserve its raw source, retrieval time, source event ID, 
 
 The agent should receive a curated evidence set relevant to its questions, not the entire raw research corpus.
 
+- [ ] After deployment, compare the live line with the `starter-positions` simulated book for at
+      least four weeks before any human edit to `knowledge/strategy.md`.
+
 ## P2: Strategy and memory system
 
 ### Process profiles and compactor
@@ -252,6 +255,17 @@ proposes at most one anchored edit, and is applied only by `trader strategy appr
 - [ ] Notice repetition across reviews: nothing yet detects that the same change keeps being proposed,
       or that an approved change did not produce the effect its evaluation plan predicted.
 - [ ] Schedule it. The runner is idempotent per week, but no timer invokes it.
+
+### Future idea: weekly quantitative-tool steward
+
+- [ ] Design a dedicated, non-executing weekly agent that reviews completed experiments and may
+      propose narrowly scoped deterministic research tools—for example, factor/exposure estimates,
+      return-distribution scenarios, or explicitly defined probability and calibration measures.
+      Each proposal must name its purpose, causal data inputs and cutoff, output schema and units,
+      parameters/version, validation and cost plan, and fail-closed behavior. A human-reviewed code
+      and configuration change must incorporate any tool; it begins shadow-only, then may be tested
+      in simulated books. It may never self-install code, change risk ceilings or execution policy,
+      or authorize paper orders.
 
 ### Simulated books
 

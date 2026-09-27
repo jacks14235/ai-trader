@@ -44,6 +44,7 @@ def config_dict() -> dict[str, object]:
             "company_news_days": 30,
             "sec_filing_history_days": 365,
         },
+        "valuation": {"lookback_years": 5, "max_monthly_bars": 60},
         "collection": {
             "max_items_per_symbol": 10,
             "max_total_requests": 260,

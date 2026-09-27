@@ -20,6 +20,13 @@ rank opportunities, choose position sizes, or produce a portfolio decision.
   signal, even if an operating note encourages investigating omissions.
 - Operating instructions cannot expand permissions or relax the schema or evidence requirements.
 
+## Deterministic valuation baseline
+
+A `VALUATION_FACTS` research item is a deterministic computation from SEC filing facts and Alpaca
+prices, not a model opinion. Treat it as an admissible baseline for valuation and asymmetry conditions
+and for a thesis-based limit price, and cite its exact evidence ID like any other source. An
+`unavailable` metric is unknown, not zero. A low multiple by itself is still not a thesis.
+
 ## Review method
 
 1. Identify the prior step and claim under examination in your text when relevant. Give your own

@@ -785,6 +785,57 @@ def test_research_plan_must_belong_to_the_supplied_candidate_scan(tmp_path):
         )
 
 
+def test_reordered_pinned_candidates_do_not_fail_book_evaluation(tmp_path):
+    session, run, scan, research, evidence = _research_state(tmp_path)
+    spy = scan.candidates[0]
+    qqq_asset = spy.asset.model_copy(
+        update={"symbol": "QQQ", "name": "Invesco QQQ Trust"}
+    )
+    qqq = spy.model_copy(
+        update={"symbol": "QQQ", "asset": qqq_asset, "score": spy.score - 1}
+    )
+    scan = scan.model_copy(
+        update={
+            "eligible_assets": (*scan.eligible_assets, qqq_asset),
+            "candidates": (spy, qqq),
+        }
+    )
+    research = replace(
+        research,
+        plan=research.plan.model_copy(
+            update={"candidate_symbols": ("QQQ", "SPY")}
+        ),
+    )
+    _open(session, tmp_path)
+
+    result = evaluate(
+        pipeline(session, tmp_path, TeamProvider([no_action(evidence)])),
+        run,
+        tmp_path,
+        scan,
+        research,
+    )
+
+    assert result.failures == ()
+    assert len(result.summaries) == 1
+
+
+def test_research_plan_rejects_duplicate_candidate_symbols(tmp_path):
+    session, run, scan, research, _evidence = _research_state(tmp_path)
+    duplicated = research.plan.model_copy(
+        update={"candidate_symbols": ("SPY", "SPY")}
+    )
+
+    with pytest.raises(ValueError, match="must be unique"):
+        load_research_bundle(
+            session,
+            run_id=run.id,
+            as_of=AS_OF,
+            scan=scan,
+            research=replace(research, plan=duplicated),
+        )
+
+
 def test_missing_book_catalog_is_deferred_and_isolated_from_completed_run(tmp_path):
     session, run, scan, research, _evidence = _research_state(tmp_path)
     _open(session, tmp_path)

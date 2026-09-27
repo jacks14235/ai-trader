@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Protocol, cast
+from typing import Protocol
 
 from alpaca.common.enums import Sort
 from alpaca.data.enums import Adjustment, DataFeed
@@ -24,6 +24,7 @@ from trader.research.models import (
     ResearchDocument,
     ResearchRequest,
 )
+from trader.research.text import alpaca_news_text
 
 ALPACA_STOCK_DATA_URL = "https://data.alpaca.markets/v2/stocks"
 ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
@@ -48,7 +49,7 @@ class AlpacaResearchProvider:
 
     provider_name: ProviderName = "alpaca"
     supported_question_types: frozenset[QuestionType] = frozenset(
-        {"MARKET_CONTEXT", "COMPANY_NEWS"}
+        {"MARKET_CONTEXT", "COMPANY_NEWS", "VALUATION_FACTS"}
     )
 
     def __init__(
@@ -61,6 +62,7 @@ class AlpacaResearchProvider:
         feed: DataFeed = DataFeed.IEX,
         max_bars: int = 100,
         max_news_items: int = 20,
+        max_monthly_bars: int = 60,
     ) -> None:
         if (stock_client is None or news_client is None) and (not key or not secret):
             raise ValueError("Alpaca credentials are required when clients are not injected")
@@ -68,6 +70,8 @@ class AlpacaResearchProvider:
             raise ValueError("max_bars must be between 1 and 1,000")
         if not 1 <= max_news_items <= 50:
             raise ValueError("max_news_items must be between 1 and 50")
+        if not 12 <= max_monthly_bars <= 60:
+            raise ValueError("max_monthly_bars must be between 12 and 60")
         self.stock_client = stock_client or StockHistoricalDataClient(
             key,
             secret,
@@ -77,15 +81,16 @@ class AlpacaResearchProvider:
         self.feed = feed
         self.max_bars = max_bars
         self.max_news_items = max_news_items
+        self.max_monthly_bars = max_monthly_bars
 
     def estimated_request_count(self, request: ResearchRequest) -> int:
         if request.question_type == "MARKET_CONTEXT":
             return 2
         if request.question_type == "COMPANY_NEWS":
             return 1
-        raise AlpacaResearchError(
-            f"Alpaca research does not support {request.question_type}"
-        )
+        if request.question_type == "VALUATION_FACTS":
+            return 1
+        raise AlpacaResearchError(f"Alpaca research does not support {request.question_type}")
 
     def collect(
         self,
@@ -97,8 +102,69 @@ class AlpacaResearchProvider:
             return self._market_context(request, retrieved_at)
         if request.question_type == "COMPANY_NEWS":
             return self._company_news(request, retrieved_at)
-        raise AlpacaResearchError(
-            f"Alpaca research does not support {request.question_type}"
+        if request.question_type == "VALUATION_FACTS":
+            return self._monthly_prices(request, retrieved_at)
+        raise AlpacaResearchError(f"Alpaca research does not support {request.question_type}")
+
+    def _monthly_prices(
+        self, request: ResearchRequest, retrieved_at: datetime | None
+    ) -> ResearchBatch:
+        try:
+            response = self.stock_client.get_stock_bars(
+                StockBarsRequest(
+                    symbol_or_symbols=request.symbol,
+                    start=request.window_start,
+                    end=request.window_end,
+                    limit=self.max_monthly_bars,
+                    timeframe=TimeFrame.Month,
+                    adjustment=Adjustment.ALL,
+                    feed=self.feed,
+                    sort=Sort.ASC,
+                )
+            )
+        except Exception as exc:
+            raise AlpacaResearchError(
+                f"Alpaca monthly-price collection failed for {request.symbol}: {exc}"
+            ) from exc
+        retrieved_at = _retrieval_time(retrieved_at)
+        payload = _json_mapping(response, "monthly stock bars")
+        bars = payload.get(request.symbol, ())
+        if not isinstance(bars, Sequence) or isinstance(bars, (str, bytes)):
+            raise AlpacaResearchError("Alpaca returned invalid monthly bars")
+        if len(bars) > self.max_monthly_bars:
+            raise AlpacaResearchError("Alpaca returned more monthly bars than requested")
+        raw = canonical_json_bytes(payload)
+        document = ResearchDocument.create(
+            question_ids=(request.question_id,),
+            provider="alpaca",
+            source_type="MARKET_DATA",
+            source_tier="BROKER",
+            source_name="Alpaca adjusted monthly bars",
+            provider_item_id=_provider_item_id("monthly-bars", request.symbol, raw),
+            url=f"{ALPACA_STOCK_DATA_URL}/bars",
+            author=None,
+            published_at=retrieved_at,
+            retrieved_at=retrieved_at,
+            symbols=(request.symbol,),
+            headline=f"{request.symbol} Alpaca adjusted monthly bars",
+            normalized_text=_normalized_json(payload),
+            summary=None,
+            raw_payload=raw,
+            metadata={
+                "endpoint": "stocks/bars",
+                "timeframe": "1Month",
+                "adjustment": "all",
+                "bar_count": len(bars),
+                "data_timestamps": list(_data_timestamps((payload,))),
+            },
+        )
+        return ResearchBatch(
+            provider="alpaca",
+            retrieved_at=retrieved_at,
+            question_ids=(request.question_id,),
+            documents=(document,),
+            request_count=1,
+            response_bytes=len(raw),
         )
 
     def _market_context(
@@ -264,7 +330,7 @@ class AlpacaResearchProvider:
             retrieved_at=retrieved_at,
             symbols=(request.symbol,),
             headline=headline,
-            normalized_text=_normalized_news(raw_news),
+            normalized_text=alpaca_news_text(raw_news) or "No matching news items.",
             summary=None,
             raw_payload=raw_payload,
             metadata={
@@ -314,27 +380,6 @@ def _normalized_json(value: object, *, max_chars: int = 100_000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n[normalized text truncated; exact payload retained]"
-
-
-def _normalized_news(items: Sequence[object]) -> str:
-    normalized: list[dict[str, object]] = []
-    for item in items:
-        mapping = cast("Mapping[object, object]", item)
-        normalized.append(
-            {
-                "id": mapping.get("id"),
-                "headline": mapping.get("headline"),
-                "source": mapping.get("source"),
-                "author": mapping.get("author"),
-                "created_at": mapping.get("created_at"),
-                "updated_at": mapping.get("updated_at"),
-                "url": mapping.get("url"),
-                "summary": mapping.get("summary"),
-                "content": mapping.get("content"),
-                "symbols": mapping.get("symbols"),
-            }
-        )
-    return _normalized_json(normalized)
 
 
 def _latest_news_timestamp(items: Sequence[object], retrieved_at: datetime) -> datetime:

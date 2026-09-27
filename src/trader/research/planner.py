@@ -69,17 +69,20 @@ class ResearchPlanner:
             raise ValueError("policy-aware deep selection exceeds its configured cap")
         if not set(deep_symbols).issubset(set(fast.candidate_symbols)):
             raise ValueError("policy-aware deep selection contains a non-candidate symbol")
-        priorities = {
-            question.symbol: question.priority for question in fast.questions
-        }
+        priorities = {question.symbol: question.priority for question in fast.questions}
         questions = list(fast.questions)
-        additional_types: tuple[QuestionType, ...] = ("COMPANY_NEWS", "SEC_FILINGS")
+        additional_types: tuple[QuestionType, ...] = (
+            "COMPANY_NEWS",
+            "SEC_FILINGS",
+            "VALUATION_FACTS",
+        )
         additional_count = self.config.selection.max_questions_per_symbol - 1
         for symbol in deep_symbols:
-            for offset, question_type in enumerate(
-                additional_types[:additional_count], start=1
-            ):
-                if question_type == "SEC_FILINGS" and symbol not in self.sec_symbols:
+            for offset, question_type in enumerate(additional_types[:additional_count], start=1):
+                if (
+                    question_type in {"SEC_FILINGS", "VALUATION_FACTS"}
+                    and symbol not in self.sec_symbols
+                ):
                     continue
                 questions.append(
                     self._question(
@@ -172,13 +175,18 @@ class ResearchPlanner:
                     priority=priorities[symbol],
                 )
             )
-        additional_types: tuple[QuestionType, ...] = ("COMPANY_NEWS", "SEC_FILINGS")
+        additional_types: tuple[QuestionType, ...] = (
+            "COMPANY_NEWS",
+            "SEC_FILINGS",
+            "VALUATION_FACTS",
+        )
         additional_count = selection.max_questions_per_symbol - 1
         for symbol in deep_symbols:
-            for offset, question_type in enumerate(
-                additional_types[:additional_count], start=1
-            ):
-                if question_type == "SEC_FILINGS" and symbol not in self.sec_symbols:
+            for offset, question_type in enumerate(additional_types[:additional_count], start=1):
+                if (
+                    question_type in {"SEC_FILINGS", "VALUATION_FACTS"}
+                    and symbol not in self.sec_symbols
+                ):
                     continue
                 questions.append(
                     self._question(
@@ -193,14 +201,11 @@ class ResearchPlanner:
         request_cost = {
             "MARKET_CONTEXT": 2,
             "COMPANY_NEWS": 1,
-            "SEC_FILINGS": (
-                2 + (3 * self.config.collection.max_primary_filings_per_symbol)
-            )
+            "SEC_FILINGS": (2 + (3 * self.config.collection.max_primary_filings_per_symbol))
             * sec_request_attempts,
-            "SEC_FILING_HISTORY": (
-                1 + (3 * self.config.collection.max_primary_filings_per_symbol)
-            )
+            "SEC_FILING_HISTORY": (1 + (3 * self.config.collection.max_primary_filings_per_symbol))
             * sec_request_attempts,
+            "VALUATION_FACTS": 1,
         }
         estimated_requests = sum(request_cost[question.question_type] for question in questions)
         if estimated_requests > self.config.collection.max_total_requests:
@@ -208,9 +213,7 @@ class ResearchPlanner:
         per_symbol: dict[str, int] = {}
         for question in questions:
             per_symbol[question.symbol] = per_symbol.get(question.symbol, 0) + 1
-        if any(
-            count > selection.max_questions_per_symbol for count in per_symbol.values()
-        ):
+        if any(count > selection.max_questions_per_symbol for count in per_symbol.values()):
             raise RuntimeError("research plan exceeds the per-symbol question cap")
 
         return ResearchPlan(
@@ -231,9 +234,7 @@ class ResearchPlanner:
             raise ValueError("universe scan contains screener data from the future")
 
     @staticmethod
-    def _normalize_input_symbols(
-        values: tuple[str, ...], *, label: str
-    ) -> tuple[str, ...]:
+    def _normalize_input_symbols(values: tuple[str, ...], *, label: str) -> tuple[str, ...]:
         normalized = tuple(value.upper().strip() for value in values)
         if len(normalized) != len(set(normalized)):
             raise ValueError(f"{label} research symbols cannot contain duplicates")
@@ -294,9 +295,12 @@ class ResearchPlanner:
         elif question_type == "COMPANY_NEWS":
             window_start = as_of - timedelta(days=freshness.company_news_days)
             query = f"Material company news and catalysts for {symbol}"
-        else:
+        elif question_type in {"SEC_FILINGS", "SEC_FILING_HISTORY"}:
             window_start = as_of - timedelta(days=freshness.sec_filings_days)
             query = f"Recent SEC filings and material disclosures for {symbol}"
+        else:
+            window_start = as_of - timedelta(days=366 * self.config.valuation.lookback_years)
+            query = f"Deterministic valuation facts and adjusted monthly prices for {symbol}"
         return ResearchQuestion.create(
             symbol=symbol,
             question_type=question_type,

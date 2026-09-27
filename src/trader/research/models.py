@@ -18,15 +18,16 @@ from pydantic import (
 
 from trader.agent.models import SYMBOL_PATTERN
 
-type ProviderName = Literal["alpaca", "sec"]
+type ProviderName = Literal["alpaca", "sec", "computed"]
 type QuestionType = Literal[
     "MARKET_CONTEXT",
     "COMPANY_NEWS",
     "SEC_FILINGS",
     "SEC_FILING_HISTORY",
+    "VALUATION_FACTS",
 ]
-type SourceType = Literal["MARKET_DATA", "NEWS", "REGULATORY_FILING"]
-type SourceTier = Literal["BROKER", "PRIMARY"]
+type SourceType = Literal["MARKET_DATA", "NEWS", "REGULATORY_FILING", "DERIVED_FACTS"]
+type SourceTier = Literal["BROKER", "PRIMARY", "DERIVED"]
 
 MAX_RAW_DOCUMENT_BYTES = 10_000_000
 MAX_NORMALIZED_TEXT_CHARS = 1_000_000
@@ -298,8 +299,14 @@ class ResearchDocument(ResearchModel):
         if self.provider == "alpaca":
             if self.source_tier != "BROKER" or self.source_type == "REGULATORY_FILING":
                 raise ValueError("Alpaca documents must be broker market data or news")
-        elif self.source_tier != "PRIMARY" or self.source_type != "REGULATORY_FILING":
+        elif self.provider == "sec" and (
+            self.source_tier != "PRIMARY" or self.source_type != "REGULATORY_FILING"
+        ):
             raise ValueError("SEC documents must be primary regulatory filings")
+        elif self.provider == "computed" and (
+            self.source_tier != "DERIVED" or self.source_type != "DERIVED_FACTS"
+        ):
+            raise ValueError("computed documents must be derived facts")
         expected_content_hash = hashlib.sha256(self.raw_payload).hexdigest()
         if self.content_hash != expected_content_hash:
             raise ValueError("content_hash does not match raw_payload")

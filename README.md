@@ -58,9 +58,13 @@ context. Current price, 20-day dollar volume, and deterministic leveraged/invers
 decide which policy-compatible names receive scarce deep slots; holdings and event symbols remain
 pinned so the portfolio can always research an exit. Deep names receive Alpaca company news and,
 when mapped to an official SEC CIK, submissions, company facts, and a bounded number of actual filing
-documents. For 8-K/6-K filings, the same fixed SEC archive path also retains the first issuer-authored
-`EX-99` release when present. ETFs and other unmapped instruments omit SEC questions rather than
-failing the run.
+documents. Model-facing news excerpts are compact plain text with markup and non-content elements
+removed, while the byte-for-byte provider payload remains in its hashed raw artifact. Mapped deep
+symbols also receive a citable `VALUATION_FACTS` item computed deterministically from SEC company
+facts, the causal current Alpaca price, and bounded adjusted monthly history. It reports explicit
+unavailability rather than substituting zero or guessing. For 8-K/6-K filings, the same fixed SEC
+archive path also retains the first issuer-authored `EX-99` release when present. ETFs and other
+unmapped instruments omit SEC questions and valuation facts rather than failing the run.
 
 Set an SEC-compliant identity in `.env` before using this pipeline:
 

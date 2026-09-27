@@ -73,6 +73,7 @@ class BoundedResearchCollector:
             "COMPANY_NEWS",
             "SEC_FILINGS",
             "SEC_FILING_HISTORY",
+            "VALUATION_FACTS",
         }
         if missing:
             raise ValueError(f"unsupported research routes: {sorted(missing)}")

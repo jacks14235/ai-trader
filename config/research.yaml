@@ -7,7 +7,11 @@ admitted_providers:
 selection:
   max_fast_candidates: 50
   max_deep_symbols: 10
-  max_questions_per_symbol: 3
+  max_questions_per_symbol: 4
+
+valuation:
+  lookback_years: 5
+  max_monthly_bars: 60
 
 follow_up:
   enabled: true

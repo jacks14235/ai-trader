@@ -1,11 +1,13 @@
 # Research Pipeline Design
 
-Status: Alpaca market/news collection, SEC filing indexes/company facts, bounded retention of actual
-primary filing documents, policy-aware deep-symbol promotion, and one model-directed follow-up round
-are implemented. The current [process-profile slice](process_profiles_plan.md) adds locally verified
-cited synthesis for simulated books. Web/paid enrichment remains future work. The daily-trader
-context and prompt remain unchanged; newly retained evidence enters through the existing evidence
-contract.
+Status: Alpaca market/news collection, cleaned model-facing news excerpts, SEC filing
+indexes/company facts, deterministic valuation facts with bounded monthly price history, bounded
+retention of actual primary filing documents, policy-aware deep-symbol promotion, and one
+model-directed follow-up round are implemented. The current
+[process-profile slice](process_profiles_plan.md) adds locally verified cited synthesis for simulated
+books. Web/paid enrichment remains future work. The daily-trader context schema remains unchanged;
+newly retained evidence enters through the existing evidence contract, and the prompts explain how
+to use the deterministic valuation baseline.
 
 ## Objective
 
@@ -29,6 +31,9 @@ deep research for a smaller set (default 8-12, holdings always eligible)
         |
         v
 normalized, deduplicated research items + immutable raw payloads
+        |
+        v
+deterministic valuation facts for mapped deep symbols
         |
         v
 bounded research-planner question -> one deterministic follow-up round
@@ -67,7 +72,18 @@ Every collected item should have:
 - collection status, bounded error details, and provider cost
 
 The exact research IDs supplied to a model must be recorded with that invocation. Research published
-or retrieved later must never be inserted into an older run context.
+or retrieved later must never be inserted into an older run context. Alpaca news keeps the original
+provider bytes in its immutable raw artifact, but its model-facing excerpt removes HTML, images,
+scripts, styles, and figures, unescapes entities, and collapses whitespace. Cleaning never replaces
+the retained source record.
+
+For every mapped deep symbol, deterministic `VALUATION_FACTS` combines SEC company-facts values with
+the already-admitted causal current price and at most five years of bounded adjusted monthly bars.
+It records formula version, selected concepts, and every input evidence ID/content hash. TTM values
+are assembled without look-ahead from derivable consecutive quarters; missing inputs become explicit
+unavailability reasons. The resulting derived item follows the normal persistence, evidence-ID, raw
+artifact, manifest, and citation contracts. ETFs and unmapped symbols are omitted, and the research
+planner cannot request this always-on deterministic question.
 
 ## Bounded policy
 

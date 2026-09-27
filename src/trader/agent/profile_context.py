@@ -111,7 +111,10 @@ def load_research_bundle(
             "research and scan must share a timestamp no later than the profile cutoff"
         )
     scan_symbols = tuple(candidate.symbol for candidate in scan.candidates)
-    if research.plan.candidate_symbols != scan_symbols:
+    plan_symbols = research.plan.candidate_symbols
+    if len(plan_symbols) != len(set(plan_symbols)):
+        raise ValueError("research plan candidates must be unique")
+    if len(plan_symbols) != len(scan_symbols) or set(plan_symbols) != set(scan_symbols):
         raise ValueError("research plan candidates must exactly match the supplied scan")
     admitted = research.persisted_research_ids
     if not admitted or len(admitted) != len(set(admitted)):

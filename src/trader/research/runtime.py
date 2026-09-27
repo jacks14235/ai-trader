@@ -168,6 +168,7 @@ class SecResolvedResearchPipeline:
             "COMPANY_NEWS": self.alpaca_provider,
             "SEC_FILINGS": sec_provider,
             "SEC_FILING_HISTORY": sec_provider,
+            "VALUATION_FACTS": self.alpaca_provider,
         }
         planner = self._planner(snapshot)
         fast_plan = planner.fast_plan(
@@ -321,6 +322,7 @@ def configured_research_pipeline(
         key,
         secret,
         max_news_items=min(50, config.collection.max_items_per_symbol),
+        max_monthly_bars=config.valuation.max_monthly_bars,
     )
     resolver = SecTickerMapResolver(
         user_agent=user_agent,
@@ -435,6 +437,7 @@ def _estimated_collection_requests(
         "COMPANY_NEWS": 1,
         "SEC_FILINGS": (2 + (3 * primary_documents)) * sec_attempts,
         "SEC_FILING_HISTORY": (1 + (3 * primary_documents)) * sec_attempts,
+        "VALUATION_FACTS": 1,
     }
     return sum(request_cost[question.question_type] for question in plan.questions)
 

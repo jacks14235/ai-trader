@@ -99,9 +99,12 @@ volume/trades, top gainers/losers, and a date-stable exploration sample. Preview
 
 Research: every candidate gets `MARKET_CONTEXT`; the fast result screens price, dollar volume, and
 leveraged/inverse product names before up to `max_deep_symbols` (default 10, holdings/events pinned)
-receive `COMPANY_NEWS` and, if ticker→CIK mapped, `SEC_FILINGS` with retained primary-document text.
-An 8-K/6-K also retains the first issuer-authored `EX-99` exhibit found in its official SEC filing
-index.
+receive cleaned plain-text `COMPANY_NEWS` and, if ticker→CIK mapped, `SEC_FILINGS` with retained
+primary-document text. Mapped deep symbols also receive deterministic, citable `VALUATION_FACTS`
+derived from SEC company facts, causal Alpaca prices, and bounded adjusted monthly history; unavailable
+metrics remain explicitly unknown. An 8-K/6-K also retains the first issuer-authored `EX-99` exhibit
+found in its official SEC filing index. Raw provider payloads remain immutable even when model-facing
+news excerpts are cleaned.
 One typed planner call may request expanded news, promote another policy-compatible candidate, or
 retrieve an older non-overlapping SEC window. Unmapped ETFs omit SEC rather than failing. Paid
 providers are disabled with a $0 budget. Evidence IDs are

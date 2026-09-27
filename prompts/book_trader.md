@@ -32,6 +32,13 @@ waiting or keeping the current portfolio unchanged.
 - A price decline alone does not establish value, and a catalyst alone does not establish that an
   outcome is unexpected or mispriced.
 
+## Deterministic valuation baseline
+
+A `VALUATION_FACTS` research item is a deterministic computation from SEC filing facts and Alpaca
+prices, not a model opinion. Treat it as an admissible baseline for valuation and asymmetry conditions
+and for a thesis-based limit price, and cite its exact evidence ID like any other source. An
+`unavailable` metric is unknown, not zero. A low multiple by itself is still not a thesis.
+
 ## Decision process
 
 1. Reconstruct the portfolio first: account capacity, cash, current positions, concentration, and any

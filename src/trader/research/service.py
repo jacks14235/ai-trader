@@ -1,14 +1,17 @@
 """Audited shadow research orchestration; this module has no execution access."""
 
 import hashlib
+import json
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
+from pydantic import JsonValue
 from sqlalchemy.orm import Session
 
 from trader.persistence.repositories import persist_research_item
@@ -18,7 +21,8 @@ from trader.research.collection import (
     write_research_artifacts,
 )
 from trader.research.config import ResearchConfig
-from trader.research.models import ResearchDocument, ResearchPlan, ResearchQuestion
+from trader.research.fundamentals import build_valuation_record, valuation_json
+from trader.research.models import ResearchBatch, ResearchDocument, ResearchPlan, ResearchQuestion
 from trader.research.selection import DeepSelectionAssessment
 from trader.universe.models import UniverseScan
 
@@ -151,6 +155,7 @@ class ShadowResearchPipeline:
         # The plan is pinned to the scan cutoff, while retrieval records the later
         # wall-clock instant at which the application actually obtained the evidence.
         collection = self.collector.collect(plan.questions)
+        collection = _append_valuation_documents(collection, plan)
         elapsed = self.setup_elapsed_seconds + (time.monotonic() - started)
         self._validate_collection(collection, elapsed)
 
@@ -276,6 +281,103 @@ def extend_research_result(
     )
 
 
+def _append_valuation_documents(
+    collection: ResearchCollection, plan: ResearchPlan
+) -> ResearchCollection:
+    """Derive valuation evidence from retained inputs; omit symbols without complete inputs."""
+    batches = list(collection.batches)
+    for question in plan.questions:
+        if question.question_type != "VALUATION_FACTS":
+            continue
+        symbol = question.symbol
+        documents = [doc for doc in collection.documents if symbol in doc.symbols]
+        facts = next(
+            (doc for doc in documents if doc.source_name == "SEC XBRL company facts"), None
+        )
+        snapshot = next(
+            (doc for doc in documents if doc.source_name == "Alpaca stock snapshot"), None
+        )
+        monthly = next(
+            (doc for doc in documents if doc.source_name == "Alpaca adjusted monthly bars"), None
+        )
+        if facts is None or snapshot is None or monthly is None:
+            continue
+        try:
+            facts_payload = json.loads(facts.raw_payload)
+            snapshot_payload = json.loads(snapshot.raw_payload)
+            monthly_payload = json.loads(monthly.raw_payload)
+            symbol_snapshot = snapshot_payload[symbol]
+            price_source = symbol_snapshot.get("latestTrade") or symbol_snapshot.get("dailyBar", {})
+            price_value = price_source.get("p") or price_source.get("c")
+            if price_value is None:
+                continue
+            observed_raw = price_source.get("t")
+            if not isinstance(observed_raw, str):
+                continue
+            observed_at = datetime.fromisoformat(observed_raw.replace("Z", "+00:00"))
+            if observed_at > plan.as_of or observed_at < plan.as_of - timedelta(hours=24):
+                continue
+            price = Decimal(str(price_value))
+            if price <= 0 or not price.is_finite():
+                continue
+            bars = monthly_payload.get(symbol, [])
+            if not isinstance(bars, list):
+                continue
+            provenance: tuple[dict[str, str], ...] = tuple(
+                {"research_id": doc.research_id, "content_hash": doc.content_hash}
+                for doc in (facts, snapshot, monthly)
+            )
+            record = build_valuation_record(
+                symbol=symbol,
+                companyfacts=facts_payload,
+                current_price=price,
+                as_of=plan.as_of,
+                monthly_bars=bars,
+                input_provenance=provenance,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            # The underlying provider documents remain available; valuation is explicitly
+            # omitted rather than guessing or falling back to an older price.
+            continue
+        raw = valuation_json(record)
+        derived = ResearchDocument.create(
+            question_ids=(question.question_id,),
+            provider="computed",
+            source_type="DERIVED_FACTS",
+            source_tier="DERIVED",
+            source_name="Deterministic valuation facts",
+            provider_item_id=f"valuation:{symbol}:{hashlib.sha256(raw).hexdigest()}",
+            url=None,
+            author=None,
+            published_at=plan.as_of,
+            retrieved_at=max(doc.retrieved_at for doc in (facts, snapshot, monthly)),
+            symbols=(symbol,),
+            headline=f"{symbol} deterministic valuation facts",
+            normalized_text=json.dumps(record, sort_keys=True, indent=2),
+            summary=None,
+            raw_payload=raw,
+            metadata={
+                "formula_version": record["formula_version"],
+                "input_provenance": cast(JsonValue, list(provenance)),
+            },
+        )
+        batches.append(
+            ResearchBatch(
+                provider="computed",
+                retrieved_at=derived.retrieved_at,
+                question_ids=(question.question_id,),
+                documents=(derived,),
+                request_count=1,
+                response_bytes=len(raw),
+            )
+        )
+    return ResearchCollection(
+        batches=tuple(batches),
+        request_count=collection.request_count,
+        response_bytes=collection.response_bytes,
+    )
+
+
 def _validate_collection_policy(
     collection: ResearchCollection,
     *,
@@ -298,10 +400,7 @@ def _validate_collection_policy(
     for document in collection.documents:
         for symbol in document.symbols:
             by_symbol[symbol].add(document.research_id)
-    if any(
-        len(research_ids) > policy.max_items_per_symbol
-        for research_ids in by_symbol.values()
-    ):
+    if any(len(research_ids) > policy.max_items_per_symbol for research_ids in by_symbol.values()):
         raise ResearchPipelineError("research collection exceeded its per-symbol item budget")
     cost = sum((batch.cost_usd for batch in collection.batches), Decimal("0"))
     if cost > config.paid.max_per_run_usd:
@@ -336,13 +435,9 @@ def _persist_documents(
         )
         artifact = artifacts[canonical.research_id]
         database_id = _run_scoped_research_id(run_id, content_hash)
-        symbols = tuple(
-            sorted({symbol for document in documents for symbol in document.symbols})
-        )
+        symbols = tuple(sorted({symbol for document in documents for symbol in document.symbols}))
         admitted_question_ids = {
-            question_id
-            for document in documents
-            for question_id in document.question_ids
+            question_id for document in documents for question_id in document.question_ids
         }
         unknown_question_ids = admitted_question_ids.difference(question_by_id)
         if unknown_question_ids:
@@ -359,9 +454,7 @@ def _persist_documents(
                 "headline": document.headline,
                 "symbols": list(document.symbols),
                 "question_ids": list(document.question_ids),
-                "raw_artifact_path": (
-                    f"research/{artifacts[document.research_id].relative_path}"
-                ),
+                "raw_artifact_path": (f"research/{artifacts[document.research_id].relative_path}"),
             }
             for document in sorted(documents, key=lambda item: item.research_id)
         ]

@@ -64,7 +64,7 @@ class EmptyProvider:
     def estimated_request_count(self, request: ResearchRequest) -> int:
         if request.question_type == "MARKET_CONTEXT":
             return 2
-        if request.question_type == "COMPANY_NEWS":
+        if request.question_type in {"COMPANY_NEWS", "VALUATION_FACTS"}:
             return 1
         return 6
 
@@ -90,7 +90,10 @@ class EmptyProvider:
 
 class PolicyMarketProvider(EmptyProvider):
     def __init__(self) -> None:
-        super().__init__("alpaca", frozenset({"MARKET_CONTEXT", "COMPANY_NEWS"}))
+        super().__init__(
+            "alpaca",
+            frozenset({"MARKET_CONTEXT", "COMPANY_NEWS", "VALUATION_FACTS"}),
+        )
 
     def collect(
         self,
@@ -99,6 +102,8 @@ class PolicyMarketProvider(EmptyProvider):
         retrieved_at: datetime | None = None,
     ) -> ResearchBatch:
         retrieved = retrieved_at or AS_OF
+        if request.question_type == "VALUATION_FACTS":
+            return super().collect(request, retrieved_at=retrieved)
         if request.question_type == "COMPANY_NEWS":
             return ResearchBatch(
                 provider="alpaca",
@@ -225,7 +230,7 @@ def test_runtime_preview_resolves_sec_map_and_omits_unmapped_sec_questions(
     session = create_session_factory(f"sqlite:///{tmp_path}/db.sqlite")()
     alpaca = EmptyProvider(
         "alpaca",
-        frozenset({"MARKET_CONTEXT", "COMPANY_NEWS"}),
+        frozenset({"MARKET_CONTEXT", "COMPANY_NEWS", "VALUATION_FACTS"}),
     )
     sec = EmptyProvider("sec", frozenset({"SEC_FILINGS", "SEC_FILING_HISTORY"}))
     runtime = SecResolvedResearchPipeline(
@@ -240,7 +245,7 @@ def test_runtime_preview_resolves_sec_map_and_omits_unmapped_sec_questions(
     preview = runtime.preview(_scan())
 
     assert resolver.calls == 1
-    assert preview.estimated_total_requests == 23
+    assert preview.estimated_total_requests == 24
     aapl_types = {
         question.question_type
         for question in preview.plan.questions
@@ -251,7 +256,12 @@ def test_runtime_preview_resolves_sec_map_and_omits_unmapped_sec_questions(
         for question in preview.plan.questions
         if question.symbol == "SPY"
     }
-    assert aapl_types == {"MARKET_CONTEXT", "COMPANY_NEWS", "SEC_FILINGS"}
+    assert aapl_types == {
+        "MARKET_CONTEXT",
+        "COMPANY_NEWS",
+        "SEC_FILINGS",
+        "VALUATION_FACTS",
+    }
     assert spy_types == {"MARKET_CONTEXT", "COMPANY_NEWS"}
 
 
@@ -263,7 +273,7 @@ def test_runtime_run_writes_both_sec_reference_artifacts(tmp_path: Path) -> None
     session.commit()
     alpaca = EmptyProvider(
         "alpaca",
-        frozenset({"MARKET_CONTEXT", "COMPANY_NEWS"}),
+        frozenset({"MARKET_CONTEXT", "COMPANY_NEWS", "VALUATION_FACTS"}),
     )
     sec = EmptyProvider("sec", frozenset({"SEC_FILINGS", "SEC_FILING_HISTORY"}))
     runtime = SecResolvedResearchPipeline(

@@ -17,7 +17,7 @@ class ResearchConfigModel(BaseModel):
 class ResearchSelectionConfig(ResearchConfigModel):
     max_fast_candidates: int = Field(ge=1, le=50)
     max_deep_symbols: int = Field(ge=8, le=12)
-    max_questions_per_symbol: int = Field(ge=1, le=3)
+    max_questions_per_symbol: int = Field(ge=1, le=4)
 
     @field_validator("*", mode="before")
     @classmethod
@@ -32,6 +32,17 @@ class ResearchSelectionConfig(ResearchConfigModel):
             raise ValueError("deep-symbol cap cannot exceed the fast-candidate cap")
         return self
 
+
+class ResearchValuationConfig(ResearchConfigModel):
+    lookback_years: int = Field(ge=1, le=5)
+    max_monthly_bars: int = Field(ge=12, le=60)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def actual_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("valuation limits must be integers")
+        return value
 
 class ResearchFollowUpConfig(ResearchConfigModel):
     """Human-owned limits for the single model-directed collection round."""
@@ -139,6 +150,7 @@ class ResearchConfig(ResearchConfigModel):
     admitted_providers: tuple[ProviderName, ...]
     selection: ResearchSelectionConfig
     follow_up: ResearchFollowUpConfig
+    valuation: ResearchValuationConfig
     collection: ResearchCollectionConfig
     freshness: ResearchFreshnessConfig
     paid: PaidResearchConfig
@@ -166,10 +178,12 @@ class ResearchConfig(ResearchConfigModel):
         additional_request_count = 0
         if self.selection.max_questions_per_symbol >= 2:
             additional_request_count += 1
-        if self.selection.max_questions_per_symbol == 3:
+        if self.selection.max_questions_per_symbol >= 3:
             sec_attempts = self.collection.max_retries_per_request + 1
             sec_endpoints = 2 + (3 * self.collection.max_primary_filings_per_symbol)
             additional_request_count += sec_endpoints * sec_attempts
+        if self.selection.max_questions_per_symbol == 4:
+            additional_request_count += 1
         largest_plan = (2 * self.selection.max_fast_candidates) + (
             self.selection.max_deep_symbols * additional_request_count
         )
