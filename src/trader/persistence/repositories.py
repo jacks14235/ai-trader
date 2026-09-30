@@ -177,7 +177,7 @@ def latest_snapshot(session: Session, *, run_id: str | None = None) -> Portfolio
 
 
 RESEARCH_SOURCE_TIERS = frozenset(
-    {"BROKER", "PRIMARY", "WEB", "PAID", "SOCIAL", "LEGACY"}
+    {"BROKER", "PRIMARY", "DERIVED", "WEB", "PAID", "SOCIAL", "LEGACY"}
 )
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9./-]{0,31}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")

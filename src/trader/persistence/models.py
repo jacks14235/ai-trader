@@ -237,7 +237,7 @@ class ResearchItem(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "content_hash"),
         CheckConstraint(
-            "source_tier IN ('BROKER', 'PRIMARY', 'WEB', 'PAID', 'SOCIAL', 'LEGACY')",
+            "source_tier IN ('BROKER', 'PRIMARY', 'DERIVED', 'WEB', 'PAID', 'SOCIAL', 'LEGACY')",
             name="valid_source_tier",
         ),
         Index("ix_research_items_run_retrieved", "run_id", "retrieved_at"),

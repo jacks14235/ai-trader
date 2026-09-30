@@ -6,6 +6,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 
 from trader.agent.models import TradeProposal
 from trader.persistence.db import create_session_factory
@@ -406,6 +407,66 @@ def test_research_migration_preserves_legacy_rows_and_downgrades(tmp_path):
         column["name"] for column in inspector.get_columns("research_items")
     }
     assert "research_item_symbols" not in inspector.get_table_names()
+
+
+def test_derived_valuation_research_persists_after_migration(tmp_path):
+    database_url = f"sqlite:///{tmp_path}/derived.sqlite"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "b83e219fc641")
+
+    session = create_session_factory(database_url, create_schema=False)()
+    run = Run(
+        run_key="daily:valuation-test",
+        scheduled_for=datetime.now(UTC),
+        config_hash="config-v1",
+    )
+    session.add(run)
+    session.commit()
+    now = datetime.now(UTC)
+    original = persist_research_item(
+        session, **_research_arguments(run.id, "original", "filing", now)
+    )
+    session.close()
+
+    command.upgrade(config, "head")
+    command.downgrade(config, "b83e219fc641")
+    command.upgrade(config, "head")
+    session = create_session_factory(database_url, create_schema=False)()
+    derived_arguments = _research_arguments(run.id, "valuation", "valuation", now)
+    derived_arguments.update(
+        source_tier="DERIVED",
+        source_type="DERIVED_FACTS",
+        source_name="Deterministic valuation facts",
+        provider="computed",
+        provider_item_id="valuation:AAPL:valuation-facts-v1",
+        research_question_id="q:valuation",
+        research_question="What do the causal valuation inputs show?",
+        cost_usd=Decimal("0"),
+    )
+    derived = persist_research_item(session, **derived_arguments)
+
+    assert persist_research_item(session, **derived_arguments).id == derived.id
+    assert session.get(ResearchItem, original.id).source_tier == "PRIMARY"
+    assert [item.id for item in available_research_as_of(
+        session, now + timedelta(minutes=1), run_id=run.id, source_tiers=["derived"]
+    )] == [derived.id]
+    assert {item.symbol for item in session.scalars(select(ResearchItemSymbol)).all()} == {"AAPL"}
+    assert {item.question_id for item in session.scalars(select(ResearchItemQuestion)).all()} == {
+        "q:material", "q:valuation"
+    }
+    session.close()
+
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
+    with pytest.raises(IntegrityError), engine.begin() as connection:
+        connection.execute(
+            text("UPDATE research_items SET source_tier = 'UNKNOWN' WHERE id = :id"),
+            {"id": derived.id},
+        )
+    with pytest.raises(RuntimeError, match="derived research items exist"):
+        command.downgrade(config, "b83e219fc641")
 
 
 def test_invocation_workflow_migration_derives_roles_and_guards_the_downgrade(tmp_path):
