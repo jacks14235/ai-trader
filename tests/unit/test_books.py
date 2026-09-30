@@ -12,7 +12,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, select, text
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
-from typer.testing import CliRunner
+from typer.main import get_command
 
 from trader.agent.catalog import load_pipeline_catalog
 from trader.agent.codex_cli import InvocationResponse
@@ -653,10 +653,11 @@ def test_books_migration_round_trips_and_guards_recorded_history(tmp_path: Path)
         command.downgrade(config, "b7e5109c34aa")
 
 
-def test_books_open_help_accepts_cash_as_a_decimal_string() -> None:
-    result = CliRunner().invoke(app, ["books", "open", "--help"])
-    assert result.exit_code == 0
-    assert "--cash" in result.stdout
+def test_books_open_cash_is_a_required_string_option() -> None:
+    open_command = get_command(app).commands["books"].commands["open"]
+    cash_option = next(option for option in open_command.params if "--cash" in option.opts)
+    assert cash_option.required
+    assert str(cash_option.type) == "STRING"
 
 
 def _research_state(
