@@ -1,0 +1,35 @@
+name: Verify paper trader
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - name: Install Python and locked dependencies
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv sync --locked --extra dev --python ${{ matrix.python-version }}
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Type-check
+        run: uv run --locked mypy src
+      - name: Unit and integration tests
+        run: uv run --locked pytest -q

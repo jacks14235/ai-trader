@@ -10,6 +10,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, cast
 
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
@@ -412,10 +415,22 @@ def verify_research_schema(session: Session) -> None:
         if missing_columns:
             detail.append("missing research_items columns: " + ", ".join(missing_columns))
         raise RuntimeError(
-            "research database schema is outdated; run `uv run alembic "
-            "-x database_url=sqlite:///data/paper/trader.db upgrade head` ("
+            "research database schema is outdated; migrate the configured "
+            "TRADER_DATABASE_URL with `uv run alembic -x database_url=<configured-url> "
+            "upgrade head` ("
             + "; ".join(detail)
             + ")"
+        )
+
+    migration_config = Config(str(Path(__file__).resolve().parents[3] / "alembic.ini"))
+    expected_heads = set(ScriptDirectory.from_config(migration_config).get_heads())
+    database_heads = set(MigrationContext.configure(session.connection()).get_current_heads())
+    if database_heads != expected_heads:
+        raise RuntimeError(
+            "research database schema is outdated; migrate the configured "
+            "TRADER_DATABASE_URL with `uv run alembic -x database_url=<configured-url> "
+            f"upgrade head` (database revisions: {sorted(database_heads)}; "
+            f"code revisions: {sorted(expected_heads)})"
         )
 
 

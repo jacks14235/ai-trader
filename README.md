@@ -24,6 +24,24 @@ Approved normalized orders reach Alpaca paper trading only when `TRADING_ENABLED
 daily run. `TRADING_ENABLED` and `TRADER_REASONING_ENABLED` both default false. Never commit `.env` or
 runtime `data/`.
 
+## Verification
+
+Run the same checks used by GitHub Actions before updating the Pi:
+
+```bash
+uv sync --locked --extra dev
+uv run --locked ruff check .
+uv run --locked mypy src
+uv run --locked pytest -q
+```
+
+The integration tests create a fresh SQLite database through Alembic, feed deterministic market and
+SEC fixtures through the staged research pipeline, and verify that computed valuation evidence is
+retained and queryable. They also compare the migrated schema with the SQLAlchemy models and test
+that every admitted research source tier can be persisted. The daily command checks the database's
+Alembic revision before collecting live data; migrate the configured `TRADER_DATABASE_URL` when
+that check reports an outdated schema. Tests do not use broker credentials or submit orders.
+
 ## Commands
 
 `status`, `daily-run`, `paper-canary`, `reconcile`, `halt`, `portfolio`, `runs list`,
